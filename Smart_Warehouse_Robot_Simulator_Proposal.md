@@ -3,7 +3,7 @@
 **Course:** AL-2002 --- Artificial Intelligence Lab\
 **Section:** BSCY - 5A\
 **Date:** 20 October 2026\
-**Project Repository:** https://github.com/anashaider/SmartWarehouseAI\
+**Project Repository:** https://github.com/anashaider/SmartWarehouseAI
 **Project Type:** AI-Based Simulation
 
 ## 1. Project Title
