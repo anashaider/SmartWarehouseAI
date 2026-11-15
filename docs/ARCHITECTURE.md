@@ -3,8 +3,13 @@
 ## 1. Layers
 
 ```
-                ┌──────────────────────── interface/ (Pygame) ────────────────────────┐
-                │ dashboard · control_panel · warehouse_view · robot_panel · analytics │
+     ┌──── interface3d/ (Panda3D, default) ────┐  ┌────── interface/ (Pygame, 2D fallback) ──────┐
+     │ app3d · scene · robots · effects ·      │  │ dashboard · control_panel · warehouse_view · │
+     │ camera · hud · analytics3d · sync       │  │ robot_panel · analytics                      │
+     └────────────────────┬────────────────────┘  └──────────────────┬───────────────────────────┘
+                          └──────────────┬───────────────────────────┘
+                ┌────────────────────────┴────────────────────────────────────────────┐
+                │  both front-ends only read state and send commands                  │
                 └───────────────┬───────────────────────────────────┬─────────────────┘
                                 │ commands / reads state            │ runs incrementally
                   simulation/simulation_controller          experiments/experiment_runner
@@ -19,7 +24,7 @@
                                        utility_based                                generator
 ```
 
-The interface and the experiment runner use the **same** `SimulationEngine`,
+Both interfaces (the 3D digital twin in `interface3d/` and the 2D dashboard in `interface/`) and the experiment runner use the **same** `SimulationEngine`,
 so everything shown on screen is the same computation that produces the
 experiment data. The engine never renders and never reads the wall clock for
 its logic (only to measure compute time).
@@ -116,6 +121,10 @@ loops with more robots than refuges.
 - **Update/render separation:** `SimulationController.update(dt)` uses a fixed-timestep accumulator (1-32 ticks/s, at most 8 ticks per frame), while rendering runs at 60 FPS. Robot positions are drawn interpolated between `previous_position` and `position` with smoothstep easing, so the animation always reflects the real cells.
 - Experiments launched from the Analytics screen run in the main loop with a 30 ms budget per frame (generator `iter_run`). No threads are used.
 - Static layers (floor, shelves, stations) are cached; dynamic overlays are drawn on one alpha surface per frame.
+
+## 6b. 3D digital twin
+
+`interface3d/` is a read-only visualisation layer over `SimulationController`. All simulation → visual mapping is in the GPU-free `interface3d/sync.py`. Details, camera system, Presentation Mode and validation: [VISUALIZATION_3D.md](VISUALIZATION_3D.md). `main.py` starts the 3D app by default and falls back to the 2D dashboard if Panda3D or OpenGL is unavailable.
 
 ## 7. Data formats
 

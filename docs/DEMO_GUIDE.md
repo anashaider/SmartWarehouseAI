@@ -4,14 +4,28 @@
 
 ```bash
 pip install -r requirements.txt
-python -m pytest -q                 # expect: 134 passed
+python -m pytest -q                 # expect: 158 passed
 python main.py --experiments        # ~1 minute, regenerates data/results and charts
-python main.py                      # open the dashboard
+python main.py                      # 3D digital twin (python main.py --2d for the 2D dashboard)
 ```
 
 Press **F1** in the app for the legend and shortcuts.
 
-## 2. Live demo script (≈ 8 minutes)
+## 2. 3D demo script (≈ 6 minutes)
+
+| Step | Action | What to say |
+|---|---|---|
+| 1 | `python main.py` and let the opening flythrough play | "A digital twin of the warehouse: racks, docks and three AMRs, generated from the same scenario the AI uses." |
+| 2 | **START**, camera **Overview** | "Robots move exactly to the cells the simulation engine computes; the 3D layer only reads the engine." |
+| 3 | Click a robot, **Robot Tracking** (F) | Chase camera: the lift rises on pickup, the beacon follows the state, the inspector shows the AI decision. |
+| 4 | **Top-Down** (T) + `C` | BFS (blue) vs A* (orange) explored cells appear in the real expansion order; the panel shows path lengths and node counts. |
+| 5 | Agent **Utility-Based**, **Robot Focus** (G) | Candidate actions and U-scores update live. |
+| 6 | **PRESENTATION** (P) | Automatic shots; every pickup/delivery highlight is a real event. P again returns; the simulation never stopped. |
+| 7 | **ANALYTICS** (A) | Recorded charts and summary tables from the 288-run experiment. |
+
+If the GPU struggles, press `Q` until Quality = Low, or run `python main.py --2d`.
+
+## 2b. 2D demo script (≈ 8 minutes)
 
 | Step | Action | What to say |
 |---|---|---|
@@ -31,7 +45,7 @@ Press **F1** in the app for the legend and shortcuts.
 - BFS and A* have equal path lengths in 960/960 queries; A* expands ~6× fewer nodes (131.2 vs 22.0).
 - Goal-Based and Utility-Based: 100% delivery in all runs. Simple Reflex: 35.8% average, 6/96 complete.
 - Nearest allocation vs fixed order: Goal-Based distance 322 → 278 cells.
-- 134 automated tests.
+- 158 automated tests (134 core + 24 for the 3D layer and launcher).
 
 ## 4. Viva questions and answers
 
@@ -70,6 +84,9 @@ It is decentralised and greedy, not an optimal multi-agent planner (e.g. CBS). R
 
 **Q: How are results reproducible?**
 Every random choice uses a seeded `random.Random`; searches break ties deterministically. Re-running yields identical counts; only wall-clock times differ. A test checks this.
+
+**Q: Is the 3D animation fake?**
+No. The 3D layer reads the engine every frame. Robots are drawn between the cell they occupied before and after the last real tick (tested to equal the simulated cell), the lift and cargo follow `robot.carrying`, and effects are created only from engine events. The AI, search and coordination code is the same one used by the 2D dashboard and the experiments.
 
 **Q: Why did the reflex agent have 0 invalid moves?**
 It perceives the four neighbouring cells and its rules only choose free ones. The invalid-move counter is still implemented and tested; it would count a move into a shelf/wall or an illegal pickup.

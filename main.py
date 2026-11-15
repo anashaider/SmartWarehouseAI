@@ -2,11 +2,14 @@
 
 Examples
 --------
-python main.py                                   # launch the interactive dashboard
+python main.py                                   # launch the 3D digital twin (falls back to 2D)
+python main.py --2d                              # classic 2D Pygame dashboard
+python main.py --quality high --present          # 3D, high graphics, start in Presentation Mode
 python main.py --layout large --agent utility_based --algorithm bfs --robots 2
 python main.py --experiments                     # run the 24-scenario experiment suite
 python main.py --headless --layout medium        # run one simulation without a window
-python main.py --screenshot docs/screenshots/simulation.png --ticks 25
+python main.py --screenshot docs/screenshots/simulation.png --ticks 25          # 2D, no window
+python main.py --screenshot3d docs/screenshots/3d_overview.png --ticks 25        # 3D, offscreen
 """
 
 from __future__ import annotations
@@ -54,7 +57,73 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--select", type=int, default=0, help="robot selected in --screenshot")
     p.add_argument("--tab", type=int, default=0, help="right panel tab in --screenshot (0-3)")
     p.add_argument("--compare", action="store_true", help="enable BFS vs A* overlay in --screenshot")
+    p.add_argument("--2d", dest="two_d", action="store_true", help="use the classic 2D Pygame dashboard")
+    p.add_argument("--quality", choices=["low", "medium", "high"], default="medium", help="3D graphics quality")
+    p.add_argument("--no-intro", action="store_true", help="skip the 3D opening flythrough")
+    p.add_argument("--present", action="store_true", help="start the 3D app in Presentation Mode")
+    p.add_argument("--screenshot3d", type=Path, help="render the 3D digital twin offscreen and save a PNG")
+    p.add_argument("--camera", choices=["overview", "topdown", "follow", "free", "focus"], default="overview",
+                   help="camera mode for --screenshot3d")
+    p.add_argument("--size", default="1600x900", help="window size for --screenshot3d, e.g. 1920x1080")
     return p.parse_args(argv)
+
+
+def launch_3d(config: SimulationConfig, args: argparse.Namespace) -> bool:
+    """Start the 3D digital twin. Returns False if 3D is unavailable (caller falls back to 2D)."""
+    from interface3d import panda3d_available
+    ok, reason = panda3d_available()
+    if not ok:
+        print(f"[3D] {reason}")
+        print("[3D] Falling back to the 2D dashboard.")
+        return False
+    try:
+        from interface3d.app3d import WarehouseApp3D
+        app = WarehouseApp3D(config, quality=args.quality, intro=not args.no_intro, size=_window_size())
+    except Exception as exc:  # noqa: BLE001 - any graphics failure -> 2D fallback
+        print(f"[3D] Could not start the 3D renderer ({exc}).")
+        print("[3D] Falling back to the 2D dashboard.")
+        return False
+    if args.present:
+        app.cmd_presentation()
+    app.run()
+    return True
+
+
+def _window_size() -> tuple[int, int]:
+    """About 90 % of the primary screen, 16:9, between 1280x720 and 1920x1080."""
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # type: ignore[attr-defined]
+        sw = ctypes.windll.user32.GetSystemMetrics(0)  # type: ignore[attr-defined]
+        sh = ctypes.windll.user32.GetSystemMetrics(1)  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        sw, sh = 1600, 900
+    w = max(1280, min(1920, int(sw * 0.9)))
+    h = max(720, min(1080, int(min(sh * 0.86, w * 9 / 16))))
+    return (int(h * 16 / 9) if int(h * 16 / 9) <= sw else w, h)
+
+
+def screenshot_3d(config: SimulationConfig, args: argparse.Namespace) -> int:
+    from interface3d.app3d import WarehouseApp3D
+    w, h = (int(v) for v in args.size.lower().split("x"))
+    app = WarehouseApp3D(config, offscreen=True, size=(w, h), quality=args.quality, intro=False)
+    app.cmd_select(args.select)
+    if args.compare:
+        app.cmd_toggle_compare()
+    for _ in range(args.ticks):
+        app.ctl.step_once()
+        app.frame(1 / 60)
+    app.cmd_camera(args.camera)
+    if args.present:
+        app.cmd_presentation()
+        app.ctl.pause()
+    if args.view == "analytics":
+        app.cmd_analytics()
+    for _ in range(150):          # let the camera settle (no simulation ticks while paused)
+        app.frame(1 / 30)
+    app.screenshot(args.screenshot3d)
+    print(f"Saved {args.screenshot3d}")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -75,6 +144,9 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(engine.metrics(), indent=2))
         return 0
 
+    if args.screenshot3d:
+        return screenshot_3d(config, args)
+
     if args.screenshot:
         os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
         from interface.dashboard import Dashboard
@@ -94,6 +166,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Saved {args.screenshot}")
         return 0
 
+    if not args.two_d and launch_3d(config, args):
+        return 0
     from interface.dashboard import launch
     launch(config)
     return 0

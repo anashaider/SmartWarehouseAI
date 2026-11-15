@@ -10,7 +10,7 @@
 
 Repository: <https://github.com/anashaider/SmartWarehouseAI>
 
-![Simulation dashboard](docs/screenshots/simulation.png)
+![3D digital twin](docs/screenshots/3d_overview.png)
 
 ---
 
@@ -30,6 +30,11 @@ other. The project implements and **measures**:
 
 Every metric, animation, decision explanation and chart is produced by the real
 simulation engine - nothing is hard-coded.
+
+The project has two front-ends on the same engine:
+
+- **3D digital twin (default)** - Panda3D: a realistic warehouse with racks, docks and AMR robots, shadows and post-processing, five camera modes, an opening flythrough, a command-center HUD and a Presentation Mode driven by real simulation events. See [docs/VISUALIZATION_3D.md](docs/VISUALIZATION_3D.md).
+- **2D dashboard (fallback / `--2d`)** - Pygame, lightweight, starts automatically if 3D is unavailable.
 
 ## 2. Problem Statement
 
@@ -53,6 +58,7 @@ Environment properties: fully observable map, deterministic, discrete, sequentia
 
 ## 3. Features
 
+- **3D digital twin:** procedural industrial warehouse (steel racks with cartons, floor safety tape, loading docks with conveyors, charging pads), detailed robots (wheels, lidar, lift, status beacon, ID panel), shadows, bloom and SSAO, three quality presets, five smoothly blended cameras with occlusion avoidance, BFS/A* explored cells revealed in real expansion order, and a cinematic Presentation Mode.
 - **Interactive Pygame dashboard** (dark navy theme): start / pause / resume / step / reset, robot count, agent, algorithm, task allocation, layout (small / medium / large / seeded random), seed, speed slider.
 - **Live warehouse view:** smooth robot motion interpolated between the cells actually occupied, heading indicators, carried parcels, planned paths, target markers, occupied-cell and reservation indicators, pickup/delivery/conflict/yield animations, and waiting badges.
 - **Explainability:** for every decision, the robot inspector shows the percepts, the available actions (with utility scores for the Utility-Based agent), the chosen action and a plain-language reason. The full decision history is browsable.
@@ -61,11 +67,11 @@ Environment properties: fully observable map, deterministic, discrete, sequentia
 - **Analytics screen:** runs the full experiment suite inside the app without freezing it, then shows the 8 charts and summary tables.
 - **Experiment runner (CLI):** reproducible, seeded, exports CSV + JSON + PNG charts.
 - **Robust I/O:** missing or corrupted layout/result files are detected and handled with clear messages and fallbacks.
-- **134 automated tests**, including a headless test that clicks the real dashboard buttons.
+- **158 automated tests**, including headless tests that click the real 2D dashboard buttons and offscreen tests of the 3D digital twin.
 
 ## 4. Technology Stack
 
-Python 3.11+ · Pygame · NumPy · Matplotlib · Pandas · Pytest · JSON. Fully offline, no paid APIs, no external pathfinding libraries.
+Python 3.11+ · Panda3D (3D) · Pygame (2D) · NumPy · Matplotlib · Pandas · Pytest · JSON. Fully offline, no paid APIs, no external pathfinding libraries, no downloaded 3D assets.
 
 ## 5. Installation
 
@@ -80,21 +86,27 @@ pip install -r requirements.txt
 ## 6. Running
 
 ```bash
-python main.py                                    # interactive dashboard
+python main.py                                    # 3D digital twin (falls back to 2D automatically)
+python main.py --quality high --present           # 3D, high graphics, start in Presentation Mode
+python main.py --quality low --no-intro           # 3D for slow GPUs, skip the opening flythrough
+python main.py --2d                               # classic 2D dashboard
 python main.py --layout large --agent utility_based --algorithm bfs --robots 2
 python main.py --layout random --seed 123         # seeded random warehouse
 python main.py --headless --layout medium         # one run without a window, prints metrics
 python main.py --experiments                      # full experiment suite (~1 min) -> data/results/
-python main.py --screenshot out.png --ticks 25    # render the dashboard to a PNG (no window)
+python main.py --screenshot out.png --ticks 25    # render the 2D dashboard to a PNG (no window)
+python main.py --screenshot3d out.png --camera follow --quality high   # render the 3D twin offscreen
 ```
 
-Keyboard shortcuts: `Space` start/pause/resume, `S` step, `R` reset, `Tab`/`1-3` select robot,
+3D controls: `Space` run/pause, `S` step, `R` reset, `1-3`/`Tab`/click select robot, `O` overview, `T` top-down, `F` robot tracking, `V` free camera, `G` robot focus, right-drag orbit, middle-drag pan, wheel zoom, `C` BFS vs A* explored cells, `P` Presentation Mode, `A` analytics, `H` hide HUD, `Q` graphics quality, `F1` help, `Esc` close/skip.
+
+2D keyboard shortcuts: `Space` start/pause/resume, `S` step, `R` reset, `Tab`/`1-3` select robot,
 `C` BFS-vs-A* overlay, `+`/`-` speed, `A` analytics, `F1` help/legend, `Esc` quit.
 
 ## 7. Tests
 
 ```bash
-python -m pytest            # 134 tests, ~15 s
+python -m pytest            # 158 tests, ~1 min (3D tests render offscreen; skipped without OpenGL)
 ```
 
 | File | Covers |
@@ -105,6 +117,9 @@ python -m pytest            # 134 tests, ~15 s
 | `test_coordination.py` | same-cell, occupied-cell and swap conflicts, waiting, head-on deadlocks, idle-robot yielding, allocation without duplicates, no collisions on any layout |
 | `test_experiments.py` | ≥ 20 unique seeded scenarios, reproducibility, metric consistency, CSV/JSON export and reload, chart generation |
 | `test_simulation.py` | end-to-end delivery on all layouts, reset determinism, controller commands, headless dashboard button test |
+| `test_visual_sync.py` | 3D poses equal simulated cells, headings, lift follows carrying, effects only from real events, dock stacks, camera maths, presentation director (no GPU needed) |
+| `test_app3d.py` | offscreen 3D app: robot nodes vs simulation, pickup/delivery visuals, BFS/A* overlay, HUD pause/resume/step/reset, presentation, cameras and occlusion, picking, quality presets, analytics, intro |
+| `test_launcher.py` | 3D is the default; 2D fallback when Panda3D is unavailable |
 
 ## 8. Experiments
 
@@ -151,6 +166,18 @@ Details, formulas and weights: [docs/ALGORITHMS.md](docs/ALGORITHMS.md). System 
 
 ## 10. Screenshots
 
+**3D digital twin**
+
+| Opening flythrough | Presentation Mode |
+|---|---|
+| ![](docs/screenshots/3d_intro.png) | ![](docs/screenshots/3d_presentation.png) |
+| **Robot tracking (third person)** | **Robot focus + utility scores** |
+| ![](docs/screenshots/3d_tracking.png) | ![](docs/screenshots/3d_focus.png) |
+| **BFS (blue) vs A\* (orange) explored cells** | **Analytics** |
+| ![](docs/screenshots/3d_bfs_vs_astar.png) | ![](docs/screenshots/3d_analytics.png) |
+
+**2D dashboard**
+
 | Decision inspector + BFS/A* overlay | Analytics |
 |---|---|
 | ![](docs/screenshots/utility_decisions_compare.png) | ![](docs/screenshots/analytics.png) |
@@ -165,7 +192,8 @@ algorithms/              bfs.py, astar.py, pathfinder.py (from scratch)
 agents/                  simple_reflex.py, goal_based.py, utility_based.py
 coordination/            conflict_manager.py, reservations.py, task_allocator.py
 simulation/              simulation_engine.py, simulation_controller.py, state_manager.py
-interface/               dashboard, warehouse view, control panel, robot panel, analytics view, widgets
+interface/               2D Pygame dashboard (fallback): warehouse view, panels, analytics, widgets
+interface3d/             3D digital twin (Panda3D): sync (GPU-free), scene, robots, effects, camera, HUD, app
 experiments/             experiment_runner.py, metrics.py, result_exporter.py, charts.py
 data/layouts/            small.json, medium.json, large.json
 data/results/            generated experiment output (git-ignored)
@@ -187,4 +215,5 @@ tools/build_layouts.py   regenerates the predefined layout JSON files
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - modules, data flow, tick algorithm, coordination
 - [docs/ALGORITHMS.md](docs/ALGORITHMS.md) - BFS, A*, agents, utility function
 - [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) - methodology, metrics, results, discussion
+- [docs/VISUALIZATION_3D.md](docs/VISUALIZATION_3D.md) - 3D digital twin design, cameras, presentation, validation
 - [docs/DEMO_GUIDE.md](docs/DEMO_GUIDE.md) - live demo script and viva preparation
