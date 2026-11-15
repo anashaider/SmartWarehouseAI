@@ -1,0 +1,25 @@
+{
+  "id": "small",
+  "name": "Small Warehouse",
+  "seed": 11,
+  "size_class": "small",
+  "description": "14x9 floor, 2 stations, 6 parcels.",
+  "map": [
+    "R.....R.....R.",
+    "..............",
+    ".##P.##..##...",
+    ".##..##.P##.P.",
+    "..............",
+    ".##P.##..##...",
+    ".##..##P.##P..",
+    "..............",
+    "...D......D..."
+  ],
+  "legend": {
+    ".": "floor",
+    "#": "shelf",
+    "D": "delivery station",
+    "R": "robot start",
+    "P": "parcel pickup"
+  }
+}
