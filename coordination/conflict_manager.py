@@ -9,9 +9,12 @@ Strategy (documented limitations in ``docs/ARCHITECTURE.md``):
    (invalid move), cells occupied *now* by robots that have not vacated them
    (vertex conflict), cells already reserved this tick (vertex conflict) and the
    reverse edge reserved this tick (swap conflict). A refused move becomes WAIT.
-3. **Deadlock breaking.** A robot blocked for ``DEADLOCK_THRESHOLD`` consecutive
-   ticks, or an idle robot that is sitting on another robot's route, is told
-   to *yield*: it side-steps to a free neighbour that is not reserved.
+3. **Deadlock breaking (priority retreat).** When robots block each other for
+   ``DEADLOCK_THRESHOLD`` consecutive ticks, or an idle robot sits on a working
+   robot's route, the robot with the lower right of way *yields*: it follows a
+   BFS path to the nearest refuge cell outside the other robot's route, holds
+   there briefly, and then resumes its own agent. A random side-step is the
+   fallback when no refuge exists.
 
 This guarantees that two robots never share a cell and never swap through
 each other. It does not compute globally optimal multi-agent plans.
@@ -20,6 +23,7 @@ each other. It does not compute globally optimal multi-agent plans.
 from __future__ import annotations
 
 import random
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -94,24 +98,64 @@ class ConflictManager:
     # ------------------------------------------------------------------ #
     # Deadlock / blocking resolution
     # ------------------------------------------------------------------ #
-    def yield_candidates(self, threshold: int, blocked_on: dict[int, int]) -> list[int]:
-        """Robots that should side-step this tick.
+    def choose_yields(self, threshold: int, blocked_on: dict[int, int]) -> list[tuple[int, int]]:
+        """Decide which robots must retreat this tick.
 
-        * idle robots (no task) that are blocking a robot with a task;
-        * the highest-id robot among those blocked for ``threshold`` ticks.
-          Only one deadlocked robot yields per tick so pairs do not both move.
+        Returns ``(yielder_id, beneficiary_id)`` pairs. ``blocked_on`` maps a
+        robot to the robot that blocked it during the previous tick.
+
+        * An idle robot (no task) that blocks a working robot yields at once.
+        * Two robots blocked for ``threshold`` ticks where the blocker is also
+          stuck (mutual / chained deadlock): the robot with the lower right of
+          way (:attr:`Robot.priority`) yields.
+        * A robot blocked for ``3 * threshold`` ticks by a robot that is not
+          itself stuck yields as a last resort.
         """
         robots = {r.robot_id: r for r in self.warehouse.robots}
-        out: list[int] = []
-        for waiter, blocker in sorted(blocked_on.items()):
-            b = robots.get(blocker)
-            if b is not None and not b.has_task and blocker not in out:
-                out.append(blocker)
-        stuck = [r.robot_id for r in self.warehouse.robots
-                 if r.blocked_streak >= threshold and r.robot_id not in out]
-        if stuck:
-            out.append(max(stuck))
-        return out
+        pairs: list[tuple[int, int]] = []
+        busy: set[int] = {r.robot_id for r in robots.values() if r.is_yielding}
+        for rid, bid in sorted(blocked_on.items()):
+            r, b = robots.get(rid), robots.get(bid)
+            if r is None or b is None or rid in busy or bid in busy:
+                continue
+            if not b.has_task:
+                pair = (bid, rid)
+            elif r.blocked_streak >= threshold and (
+                blocked_on.get(bid) is not None or b.blocked_streak >= threshold
+            ):
+                pair = (rid, bid) if r.priority > b.priority else (bid, rid)
+            elif r.blocked_streak >= 3 * threshold:
+                pair = (rid, bid)
+            else:
+                continue
+            pairs.append(pair)
+            busy.update(pair)
+        return pairs
+
+    def refuge_path(self, yielder: Robot, route: set[Position]) -> list[Position]:
+        """Shortest path (BFS) from ``yielder`` to the nearest free cell outside
+        ``route`` - the cells the other robot needs. Other robots are obstacles.
+        Returns the cells to traverse (excluding the start); empty if none exists
+        or the yielder is already off the route."""
+        if yielder.position not in route:
+            return []
+        grid = self.warehouse.grid
+        occupied = self.warehouse.occupied_cells(exclude=yielder.robot_id)
+        parent: dict[Position, Optional[Position]] = {yielder.position: None}
+        queue = deque([yielder.position])
+        while queue:
+            cur = queue.popleft()
+            if cur not in route:
+                path = [cur]
+                while parent[path[-1]] is not None:
+                    path.append(parent[path[-1]])  # type: ignore[arg-type]
+                path.reverse()
+                return path[1:]
+            for nxt in grid.neighbors(cur):
+                if nxt not in parent and nxt not in occupied:
+                    parent[nxt] = cur
+                    queue.append(nxt)
+        return []
 
     def yield_move(self, robot: Robot, avoid: set[Position]) -> Optional[Action]:
         """Random (seeded) free neighbouring move, preferring cells not in ``avoid``."""

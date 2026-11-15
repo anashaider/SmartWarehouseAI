@@ -60,7 +60,10 @@ STEP_LIMIT_PER_CELL: float = 2.0
 
 #: Consecutive blocked ticks after which a robot is considered deadlocked and
 #: the coordination layer forces a "yield" (side step).
-DEADLOCK_THRESHOLD: int = 4
+DEADLOCK_THRESHOLD: int = 3
+
+#: Ticks a yielding robot holds its refuge cell after retreating.
+YIELD_HOLD_TICKS: int = 2
 
 #: Consecutive blocked ticks after which the Goal-Based agent replans while
 #: treating every other robot as an obstacle.

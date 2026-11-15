@@ -75,6 +75,10 @@ class Robot:
     start_position: Position = field(init=False)
     delivery_history: list[DeliveryRecord] = field(default_factory=list)
     planned_path: list[Position] = field(default_factory=list)
+    # Coordination-layer retreat ("yield") state.
+    yield_path: list[Position] = field(default_factory=list)
+    yield_hold: int = 0
+    yield_to: Optional[int] = None
 
     def __post_init__(self) -> None:
         self.previous_position = self.position
@@ -91,6 +95,15 @@ class Robot:
     @property
     def has_task(self) -> bool:
         return self.assigned_parcel is not None
+
+    @property
+    def is_yielding(self) -> bool:
+        return bool(self.yield_path) or self.yield_hold > 0
+
+    @property
+    def priority(self) -> tuple[int, int, int]:
+        """Smaller tuple = higher right of way (carrying > has task > idle, then id)."""
+        return (0 if self.is_carrying else 1, 0 if self.has_task else 1, self.robot_id)
 
     def can_transition(self, new_state: RobotState) -> bool:
         return new_state in ALLOWED_TRANSITIONS[self.state]

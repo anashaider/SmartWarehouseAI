@@ -25,6 +25,7 @@ from agents.base_agent import FREE, ROBOT, SHELF, WALL, BaseAgent, CandidateActi
 from algorithms.pathfinder import Pathfinder
 from config.settings import (
     DEADLOCK_THRESHOLD,
+    YIELD_HOLD_TICKS,
     DECISION_HISTORY_LIMIT,
     MIN_STEP_LIMIT,
     STEP_LIMIT_PER_CELL,
@@ -32,7 +33,7 @@ from config.settings import (
 )
 from coordination.conflict_manager import ConflictManager, MoveOutcome
 from coordination.task_allocator import TaskAllocator
-from environment.grid import MOVE_ACTIONS, Action, Position, apply_move, manhattan
+from environment.grid import MOVE_ACTIONS, Action, Position, action_between, apply_move, manhattan
 from environment.robot import Robot
 from environment.scenario_generator import Scenario
 from environment.warehouse import Warehouse
@@ -180,12 +181,13 @@ class SimulationEngine:
         cm.begin_tick()
         order = cm.turn_order(step)
         self.last_tick_order = order
-        yielders = set(cm.yield_candidates(DEADLOCK_THRESHOLD, self._blocked_on))
+        self._plan_yields(events)
         self._blocked_on = {}
 
         for robot in wh.iter_robots(order):
             robot.previous_position = robot.position
-            if robot.robot_id in yielders and self._do_yield(robot, events):
+            if robot.is_yielding:
+                self._step_yield(robot, events)
                 continue
             percept = self.build_percept(robot)
             decision = self.agents[robot.robot_id].decide(percept)
@@ -199,31 +201,90 @@ class SimulationEngine:
         self._check_termination()
         return events
 
-    def _do_yield(self, robot: Robot, events: list[TickEvent]) -> bool:
-        avoid: set[Position] = set()
-        for other in self.warehouse.robots:
-            if other.robot_id != robot.robot_id:
-                avoid.update(other.planned_path[:6])
-        action = self.conflicts.yield_move(robot, avoid)
-        if action is None:
-            return False
+    # ------------------------------------------------------------------ #
+    # Deadlock handling (coordination override)
+    # ------------------------------------------------------------------ #
+    def route_cells(self, robot: Robot) -> set[Position]:
+        """Cells ``robot`` needs: its current plan plus one static shortest route."""
+        cells = {robot.position, *robot.planned_path}
+        target = self.warehouse.parcel_target(robot)
+        if target is None:
+            return cells
+        dist = self.distance_field(target)
+        cur = robot.position
+        while cur in dist and dist[cur] > 0:
+            nxt = next((n for n in self.warehouse.grid.neighbors(cur)
+                        if dist.get(n) == dist[cur] - 1), None)
+            if nxt is None:
+                break
+            cells.add(nxt)
+            cur = nxt
+        return cells
+
+    def _plan_yields(self, events: list[TickEvent]) -> None:
+        robots = {r.robot_id: r for r in self.warehouse.robots}
+        for yid, bid in self.conflicts.choose_yields(DEADLOCK_THRESHOLD, self._blocked_on):
+            yielder, beneficiary = robots[yid], robots[bid]
+            path = self.conflicts.refuge_path(yielder, self.route_cells(beneficiary))
+            if not path:
+                # The yielder is trapped (e.g. dead end): swap roles if possible.
+                alt = self.conflicts.refuge_path(beneficiary, self.route_cells(yielder))
+                if alt:
+                    yielder, beneficiary, path = beneficiary, yielder, alt
+            if not path:
+                action = self.conflicts.yield_move(yielder, self.route_cells(beneficiary))
+                if action is None:
+                    continue
+                path = [apply_move(yielder.position, action)]
+            yielder.yield_path = path
+            yielder.yield_hold = YIELD_HOLD_TICKS
+            yielder.yield_to = beneficiary.robot_id
+            yielder.planned_path = [yielder.position, *path]
+            self.deadlocks_resolved += 1
+            self.conflicts.deadlocks_resolved += 1
+            self.agents[yielder.robot_id].reset_task_memory()
+            events.append(TickEvent(
+                self.step_count, "yield", yielder.robot_id, path[-1],
+                f"R{yielder.robot_id} yields to R{beneficiary.robot_id}: "
+                f"retreating {len(path)} cell(s) to {path[-1]}"))
+
+    def _step_yield(self, robot: Robot, events: list[TickEvent]) -> None:
+        cm = self.conflicts
         src = robot.position
-        dst = apply_move(src, action)
-        self.warehouse.move_robot(robot, dst)
-        self.conflicts.commit(robot, src, dst)
-        robot.direction = action
-        robot.current_action = action
+        to = robot.yield_to
+        if robot.yield_path:
+            nxt = robot.yield_path[0]
+            action = action_between(src, nxt)
+            check = cm.check_move(robot, action)
+            if check.ok:
+                self.warehouse.move_robot(robot, nxt)
+                cm.commit(robot, src, nxt)
+                robot.yield_path.pop(0)
+                robot.direction = action
+                executed, outcome = action, "retreating"
+            else:
+                cm.commit(robot, src, src)
+                robot.yield_path = []  # refuge route blocked: hold here instead
+                executed, outcome = Action.WAIT, "retreat blocked; holding"
+            reason = (f"Coordination override: deadlock with R{to} detected. R{to} has "
+                      f"right of way, so this robot retreats to a refuge cell "
+                      f"({len(robot.yield_path)} cell(s) left).")
+        else:
+            cm.commit(robot, src, src)
+            robot.yield_hold -= 1
+            robot.waits += 1
+            executed, outcome = Action.WAIT, "holding at refuge"
+            reason = (f"Coordination override: holding at refuge cell so R{to} can pass "
+                      f"({robot.yield_hold} tick(s) left).")
+        robot.planned_path = [robot.position, *robot.yield_path]
+        robot.current_action = executed
         robot.blocked_streak = 0
-        robot.planned_path = []
-        self.deadlocks_resolved += 1
-        self.conflicts.deadlocks_resolved += 1
-        self.agents[robot.robot_id].reset_task_memory()
-        msg = f"R{robot.robot_id} yields: side-steps {action.name.lower()} to clear a blocked route"
-        events.append(TickEvent(self.step_count, "yield", robot.robot_id, dst, msg))
-        self._record(robot, {"Override": "coordination layer"}, [CandidateAction(action, True, note="yield")],
-                     action, action, "Coordination override: deadlock/blocking detected, "
-                     f"robot side-steps {action.name.lower()} so others can pass.", "yielded", {})
-        return True
+        if not robot.is_yielding:
+            robot.yield_to = None
+            self.agents[robot.robot_id].reset_task_memory()
+        self._record(robot, {"Override": "coordination layer (yield)"},
+                     [CandidateAction(executed, True, note="yield")],
+                     executed, executed, reason, outcome, {})
 
     def _execute(self, robot: Robot, percept: Percept, decision: Decision,
                  events: list[TickEvent]) -> None:
