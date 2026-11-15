@@ -86,7 +86,8 @@ def main(argv: list[str] | None = None) -> int:
             app._on_view("compare", True)
         for _ in range(args.ticks):
             app.ctl.step_once()
-            app.view.add_events(app.ctl.update(0.0))
+            events = app.ctl.update(0.0)
+        app.view.add_events(events if args.ticks else [])  # effects of the final tick only
         app.ctl.last_tick_time = 0.0  # show the settled (post-animation) state
         app.render()
         app.save_screenshot(args.screenshot)

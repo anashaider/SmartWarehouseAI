@@ -300,7 +300,7 @@ class Dashboard:
             for k, line in enumerate(label.upper().split("|")):
                 T.draw_text(s, line, (r.x + 12, r.y + 12 + k * 13), 10, T.TEXT_MUTED, bold=True,
                             max_width=r.width - 16)
-            size = 26 if len(value) <= 5 else 20
+            size = 26 if len(value) <= 3 else 20 if len(value) <= 5 else 16
             T.draw_text(s, value, (r.x + 12, r.bottom - 14), size, colr, bold=True, anchor="bottomleft",
                         max_width=r.width - 16)
         r = pygame.Rect(area.right - comp_w, area.y, comp_w, area.height)
