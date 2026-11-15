@@ -25,6 +25,7 @@ def bfs(
     start: Position,
     goal: Position,
     blocked: Iterable[Position] = (),
+    trace: bool = False,
 ) -> SearchResult:
     """Shortest path from ``start`` to ``goal`` avoiding shelves and ``blocked`` cells.
 
@@ -51,6 +52,8 @@ def bfs(
     while frontier:
         node = frontier.popleft()
         result.nodes_expanded += 1
+        if trace:
+            result.explored.append(node)
         for child in grid.neighbors(node):
             if child in parent or child in blocked_set:
                 continue

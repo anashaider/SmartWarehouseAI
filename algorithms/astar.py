@@ -30,6 +30,7 @@ def astar(
     start: Position,
     goal: Position,
     blocked: Iterable[Position] = (),
+    trace: bool = False,
 ) -> SearchResult:
     """Shortest path from ``start`` to ``goal`` using A* with the Manhattan heuristic."""
     t0 = time.perf_counter()
@@ -58,6 +59,8 @@ def astar(
             break
         closed.add(node)
         result.nodes_expanded += 1
+        if trace:
+            result.explored.append(node)
         g_next = g_score[node] + 1
         for child in grid.neighbors(node):
             if child in closed or child in blocked_set:

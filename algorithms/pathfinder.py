@@ -60,4 +60,5 @@ def compare(grid: Grid, start: Position, goal: Position,
             blocked: Iterable[Position] = ()) -> dict[str, SearchResult]:
     """Run both algorithms on the same query (used by the UI comparison overlay)."""
     blocked = tuple(blocked)
-    return {name: fn(grid, start, goal, blocked) for name, fn in SEARCH_FUNCTIONS.items()}
+    return {name: fn(grid, start, goal, blocked, trace=True)  # type: ignore[call-arg]
+            for name, fn in SEARCH_FUNCTIONS.items()}

@@ -57,7 +57,7 @@ def _style(ax: plt.Axes, title: str, ylabel: str, xlabel: str = "") -> None:
 
 
 def _figure() -> tuple[plt.Figure, plt.Axes]:
-    fig, ax = plt.subplots(figsize=(8.0, 4.6), dpi=110)
+    fig, ax = plt.subplots(figsize=(8.0, 4.6), dpi=150)
     fig.patch.set_facecolor(SURFACE)
     return fig, ax
 
@@ -176,7 +176,7 @@ def generate_all_charts(results: ExperimentResults, out_dir: Path = CHARTS_DIR) 
     # 7. Scenario-wise success heatmap -------------------------------------
     pivot = runs.pivot_table(index="agent_label", columns="scenario_id",
                              values="completion_pct", aggfunc="mean").reindex(AGENT_ORDER)
-    fig, ax = plt.subplots(figsize=(11.0, 3.6), dpi=110)
+    fig, ax = plt.subplots(figsize=(11.0, 3.6), dpi=150)
     fig.patch.set_facecolor(SURFACE)
     cmap = LinearSegmentedColormap.from_list("seq", SEQ[::-1])
     im = ax.imshow(pivot.values, aspect="auto", cmap=cmap, vmin=0, vmax=100)

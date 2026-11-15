@@ -162,16 +162,28 @@ def scenario_from_dict(data: dict[str, Any], scenario_id: str | None = None) -> 
             elif ch == "P":
                 pickups.append((r, c))
 
-    # Destinations: explicit list in JSON, otherwise a seeded assignment.
-    explicit = data.get("destinations")
-    rng = random.Random(seed)
     parcels: list[ParcelSpec] = []
-    for i, pos in enumerate(pickups):
-        if isinstance(explicit, list) and i < len(explicit):
-            dest = int(explicit[i])
-        else:
-            dest = rng.randrange(len(stations)) if stations else 0
-        parcels.append(ParcelSpec(pos, dest))
+    explicit_parcels = data.get("parcels")
+    if isinstance(explicit_parcels, list) and explicit_parcels:
+        # Ordered parcel list (written by save_scenario): preserves ids and destinations.
+        try:
+            for item in explicit_parcels:
+                parcels.append(ParcelSpec((int(item["position"][0]), int(item["position"][1])),
+                                          int(item["destination"])))
+        except (KeyError, TypeError, ValueError, IndexError) as exc:
+            raise ScenarioError(f"Malformed 'parcels' entry: {exc}") from exc
+        if sorted(p.position for p in parcels) != sorted(pickups):
+            raise ScenarioError("'parcels' positions do not match the 'P' cells of the map")
+    else:
+        # Destinations: explicit list (row-major parcel order) or a seeded assignment.
+        explicit = data.get("destinations")
+        rng = random.Random(seed)
+        for i, pos in enumerate(pickups):
+            if isinstance(explicit, list) and i < len(explicit):
+                dest = int(explicit[i])
+            else:
+                dest = rng.randrange(len(stations)) if stations else 0
+            parcels.append(ParcelSpec(pos, dest))
 
     scenario = Scenario(
         scenario_id=scenario_id or str(data.get("id", name.lower().replace(" ", "_"))),
@@ -236,7 +248,8 @@ def save_scenario(scenario: Scenario, path: Path) -> None:
         "seed": scenario.seed,
         "size_class": scenario.size_class,
         "map": ["".join(r) for r in rows],
-        "destinations": [p.destination_id for p in scenario.parcels],
+        "parcels": [{"position": list(p.position), "destination": p.destination_id}
+                    for p in scenario.parcels],
     }
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")

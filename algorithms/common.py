@@ -23,6 +23,9 @@ class SearchResult:
     nodes_expanded: int = 0
     nodes_generated: int = 0
     runtime_ms: float = 0.0
+    #: Expansion order, recorded only when the search is called with ``trace=True``
+    #: (used by the UI to visualise the explored region).
+    explored: list[Position] = field(default_factory=list)
 
     @property
     def found(self) -> bool:
