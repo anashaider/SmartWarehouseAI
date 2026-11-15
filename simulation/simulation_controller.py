@@ -46,6 +46,9 @@ class SimulationController:
         self._accum = 0.0
         self.last_tick_time = time.perf_counter()
         self.new_events: list[TickEvent] = []
+        #: Observers called after every tick with (engine, events). Used by the
+        #: 3D layer's analytics overlays; they must not modify the engine.
+        self.tick_listeners: list = []
         self.load()
 
     # ------------------------------------------------------------------ #
@@ -132,6 +135,8 @@ class SimulationController:
     def _tick(self) -> None:
         events = self.engine.step()
         self.new_events.extend(events)
+        for listener in self.tick_listeners:
+            listener(self.engine, events)
         self.last_tick_time = time.perf_counter()
         if self.engine.done:
             self.state.set(SimStatus.FINISHED)
@@ -157,5 +162,7 @@ class SimulationController:
 
     def animation_progress(self) -> float:
         """0..1 progress of the movement animation of the last tick."""
-        duration = min(1.0 / self.ticks_per_second, 0.28) * 0.9
+        # Robots glide for most of the tick interval (continuous motion at normal
+        # speeds), capped so very slow speeds still show crisp moves.
+        duration = min(0.95 / self.ticks_per_second, 0.6)
         return max(0.0, min(1.0, (time.perf_counter() - self.last_tick_time) / duration))

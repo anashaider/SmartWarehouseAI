@@ -23,6 +23,7 @@ from interface3d import textures
 from interface3d.geometry import MeshBuilder, rgba
 from interface3d.sync import VisualEffect, world_xy
 
+REVEAL_BUCKETS = 24
 BFS_RGBA = rgba("#3987e5")
 ASTAR_RGBA = rgba("#d95926")
 EFFECT_COLORS = {
@@ -37,6 +38,9 @@ EFFECT_COLORS = {
 
 
 def _overlay(np_: NodePath, bin_order: int = 10) -> NodePath:
+    # Polygon depth offset keeps floor-level overlays above the floor even with the
+    # lower depth precision of the post-processing (filter) render target.
+    np_.setDepthOffset(2)
     np_.setTransparency(TransparencyAttrib.MAlpha)
     np_.setLightOff(1)
     np_.setShaderOff(1)
@@ -79,8 +83,9 @@ class EffectsLayer:
         self.explored_key: Optional[tuple] = None
         self.explored_tiles: list[tuple[NodePath, int, int]] = []   # node, order index, algorithm(0 bfs,1 a*)
         self.explored_started = 0.0
+        self._buckets: list[tuple[NodePath, int]] = []
         self.compare_paths = self.root.attachNewNode("compare-paths")
-        self.event_nodes: dict[int, NodePath] = {}
+        self.event_nodes: dict[int, tuple] = {}
 
     def destroy(self) -> None:
         self.root.removeNode()
@@ -133,35 +138,46 @@ class EffectsLayer:
 
     # ------------------------------------------------------------------ BFS / A*
     def set_comparison(self, key: Optional[tuple], results: Optional[dict[str, SearchResult]], now: float) -> None:
-        """Explored-cell tiles in real expansion order (revealed progressively)."""
+        """Explored cells of both searches, revealed progressively in real expansion order.
+
+        Cells are merged into ``REVEAL_BUCKETS`` geoms per algorithm (one draw call
+        per bucket instead of one per cell). ``explored_tiles`` keeps one entry per
+        explored cell: (bucket node, expansion index, algorithm index).
+        """
         if key == self.explored_key:
             return
         self.explored_key = key
         self.explored_root.getChildren().detach()
         self.compare_paths.getChildren().detach()
         self.explored_tiles = []
+        self._buckets = []
         self.explored_started = now
         if not results:
             return
         for algo_idx, (name, color, size, z) in enumerate((("bfs", BFS_RGBA, 0.9, 0.012), ("astar", ASTAR_RGBA, 0.5, 0.03))):
             res = results.get(name)
-            if res is None:
+            if res is None or not res.explored:
                 continue
-            for i, cell in enumerate(res.explored):
-                mb = MeshBuilder("tile")
-                x, y = world_xy(cell, self.height)
-                mb.flat_rect(x - size / 2, y - size / 2, x + size / 2, y + size / 2, z,
-                             (color[0], color[1], color[2], 0.32 if name == "bfs" else 0.75))
-                t = _overlay(self.explored_root.attachNewNode(mb.node()), 11)
-                t.hide()
-                self.explored_tiles.append((t, i, algo_idx))
+            n = len(res.explored)
+            per = max(1, -(-n // REVEAL_BUCKETS))
+            alpha = 0.32 if name == "bfs" else 0.75
+            for b0 in range(0, n, per):
+                mb = MeshBuilder(f"{name}-bucket")
+                for cell in res.explored[b0:b0 + per]:
+                    x, y = world_xy(cell, self.height)
+                    mb.flat_rect(x - size / 2, y - size / 2, x + size / 2, y + size / 2, z,
+                                 (color[0], color[1], color[2], alpha))
+                node = _overlay(self.explored_root.attachNewNode(mb.node()), 11)
+                node.hide()
+                self._buckets.append((node, b0))
+                for i in range(b0, min(n, b0 + per)):
+                    self.explored_tiles.append((node, i, algo_idx))
             ribbon = path_ribbon(res.path, self.height, (color[0], color[1], color[2], 0.95), width=0.1,
                                  z=0.04 + 0.01 * algo_idx)
             if ribbon is not None:
                 ribbon.reparentTo(self.compare_paths)
                 off = 0.09 if name == "astar" else -0.09
                 ribbon.setPos(off, off, 0)
-        self.explored_root.flattenLight()
 
     def animate_comparison(self, visible: bool, now: float, reveal_seconds: float = 2.0) -> None:
         if not visible:
@@ -170,13 +186,10 @@ class EffectsLayer:
             return
         self.explored_root.show()
         self.compare_paths.show()
-        counts = [0, 0]
-        for _, i, a in self.explored_tiles:
-            counts[a] = max(counts[a], i + 1)
-        longest = max(1, max(counts))
+        longest = max((i + 1 for _, i, _ in self.explored_tiles), default=1)
         shown = int(longest * min(1.0, (now - self.explored_started) / reveal_seconds)) + 1
-        for node, i, _a in self.explored_tiles:
-            if i < shown:
+        for node, first in self._buckets:
+            if first < shown:
                 node.show()
             else:
                 node.hide()
@@ -187,26 +200,24 @@ class EffectsLayer:
         for fx in effects:
             key = id(fx)
             alive.add(key)
-            node = self.event_nodes.get(key)
-            if node is None:
+            entry = self.event_nodes.get(key)
+            if entry is None:
                 node = self._make_event_node(fx)
-                self.event_nodes[key] = node
+                entry = (node, node.find("**/fx-ring"), node.find("**/fx-label"), node.find("**/fx-column"))
+                self.event_nodes[key] = entry
+            node, ring, label, column = entry
             t = max(0.0, min(1.0, fx.progress(now)))
-            fade = 1.0 - t
-            node.setAlphaScale(fade)
-            ring = node.find("**/fx-ring")
+            node.setAlphaScale(1.0 - t)
             if not ring.isEmpty():
                 s = 0.6 + 1.4 * t
                 ring.setScale(s, s, 1)
-            label = node.find("**/fx-label")
             if not label.isEmpty():
                 label.setZ(1.0 + 0.8 * t)
-            column = node.find("**/fx-column")
             if not column.isEmpty():
                 column.setScale(1, 1, 0.3 + 1.2 * math.sin(math.pi * min(1.0, t * 1.2)))
         for key in list(self.event_nodes):
             if key not in alive:
-                self.event_nodes.pop(key).removeNode()
+                self.event_nodes.pop(key)[0].removeNode()
 
     def _make_event_node(self, fx: VisualEffect) -> NodePath:
         color = EFFECT_COLORS.get(fx.kind, (1, 1, 1, 1))
@@ -239,3 +250,51 @@ class EffectsLayer:
             lab.setBin("fixed", 40)
             lab.setDepthTest(False)
         return node
+
+
+class HeatmapLayer:
+    """Congestion heatmap: one quad per walkable cell; colours rewritten in place.
+
+    Single-hue sequential encoding (alpha and lightness rise with heat), drawn as
+    a translucent floor overlay. No nodes are created after construction.
+    """
+
+    COLOR = rgba("#ff4d2e")
+
+    def __init__(self, parent: NodePath, grid, height: int) -> None:
+        from panda3d.core import Geom
+        self.cells = grid.walkable_cells()
+        mb = MeshBuilder("heatmap")
+        mb.vdata.setUsageHint(Geom.UHDynamic)
+        for cell in self.cells:
+            x, y = world_xy(cell, height)
+            mb.flat_rect(x - 0.48, y - 0.48, x + 0.48, y + 0.48, 0.008, (0, 0, 0, 0))
+        self.root = _overlay(parent.attachNewNode(mb.node()), 9)
+        self.geom_node = self.root.node()
+        self.version = -1
+        self.root.hide()
+
+    def update(self, heat: dict, version: int, norm: float = 4.0) -> None:
+        if version == self.version:
+            return
+        self.version = version
+        from panda3d.core import GeomVertexWriter
+        vdata = self.geom_node.modifyGeom(0).modifyVertexData()
+        writer = GeomVertexWriter(vdata, "color")
+        r, g, b, _ = self.COLOR
+        for cell in self.cells:
+            v = min(1.0, heat.get(cell, 0.0) / norm)
+            if v < 0.03:
+                col = (0, 0, 0, 0)
+            else:
+                # one hue; low heat = dim and translucent, high heat = bright and opaque
+                light = 0.6 + 0.4 * v
+                col = (r * light, g * light * (0.5 + 0.5 * v), b * light, 0.3 + 0.6 * v)
+            for _ in range(4):
+                writer.setData4(*col)
+
+    def set_visible(self, visible: bool) -> None:
+        (self.root.show if visible else self.root.hide)()
+
+    def destroy(self) -> None:
+        self.root.removeNode()

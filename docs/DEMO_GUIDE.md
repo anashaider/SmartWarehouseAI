@@ -4,7 +4,7 @@
 
 ```bash
 pip install -r requirements.txt
-python -m pytest -q                 # expect: 158 passed
+python -m pytest -q                 # expect: 181 passed
 python main.py --experiments        # ~1 minute, regenerates data/results and charts
 python main.py                      # 3D digital twin (python main.py --2d for the 2D dashboard)
 ```
@@ -17,9 +17,10 @@ Press **F1** in the app for the legend and shortcuts.
 |---|---|---|
 | 1 | `python main.py` and let the opening flythrough play | "A digital twin of the warehouse: racks, docks and three AMRs, generated from the same scenario the AI uses." |
 | 2 | **START**, camera **Overview** | "Robots move exactly to the cells the simulation engine computes; the 3D layer only reads the engine." |
-| 3 | Click a robot, **Robot Tracking** (F) | Chase camera: the lift rises on pickup, the beacon follows the state, the inspector shows the AI decision. |
+| 3 | Click a robot, **Third-Person** (F) or **Robot Tracking** (K) | Chase camera: the robot drives under the parcel stand and lifts the carton, the LED band follows the state, the inspector shows the AI decision. |
 | 4 | **Top-Down** (T) + `C` | BFS (blue) vs A* (orange) explored cells appear in the real expansion order; the panel shows path lengths and node counts. |
 | 5 | Agent **Utility-Based**, **Robot Focus** (G) | Candidate actions and U-scores update live. |
+| 5b | Press `M`, open the **FLEET** tab | Congestion heatmap and utilisation come from the engine every tick; dock signs count real deliveries. Try Simple Reflex to see hotspots form where robots get stuck. |
 | 6 | **PRESENTATION** (P) | Automatic shots; every pickup/delivery highlight is a real event. P again returns; the simulation never stopped. |
 | 7 | **ANALYTICS** (A) | Recorded charts and summary tables from the 288-run experiment. |
 
@@ -45,7 +46,7 @@ If the GPU struggles, press `Q` until Quality = Low, or run `python main.py --2d
 - BFS and A* have equal path lengths in 960/960 queries; A* expands ~6× fewer nodes (131.2 vs 22.0).
 - Goal-Based and Utility-Based: 100% delivery in all runs. Simple Reflex: 35.8% average, 6/96 complete.
 - Nearest allocation vs fixed order: Goal-Based distance 322 → 278 cells.
-- 158 automated tests (134 core + 24 for the 3D layer and launcher).
+- 181 automated tests (134 core + 47 for the 3D layer and launcher).
 
 ## 4. Viva questions and answers
 

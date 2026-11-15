@@ -72,6 +72,47 @@ def smoothstep(t: float) -> float:
     return t * t * (3 - 2 * t)
 
 
+WHEEL_RADIUS = 0.08       # drive wheel radius (world units)
+WHEEL_TRACK = 0.30        # half distance between the two drive wheels
+CRUISE_SPEED = 3.0        # cells / second used to normalise the speed indicator
+
+
+def motion_profile(t: float, ease_in: bool, ease_out: bool) -> float:
+    """Fraction of the cell-to-cell distance covered at normalised time ``t``.
+
+    Always 0 at t=0 and 1 at t=1 (so the robot is exactly on the simulated
+    cells at both ends of a tick). Velocity is 0 at an eased end and equals the
+    cruise velocity (slope 1) at a non-eased end, so consecutive straight moves
+    join without stopping:
+        both eased  -> smoothstep (accelerate + decelerate)
+        in only     -> t^2 (2 - t)          (accelerate, leave at cruise speed)
+        out only    -> 1 - (1-t)^2 (1+t)    (arrive at cruise speed, decelerate)
+        neither     -> t                    (cruise)
+    """
+    t = max(0.0, min(1.0, t))
+    if ease_in and ease_out:
+        return t * t * (3 - 2 * t)
+    if ease_in:
+        return t * t * (2 - t)
+    if ease_out:
+        return 1 - (1 - t) * (1 - t) * (1 + t)
+    return t
+
+
+def continues_straight(plan: list, a: Position, b: Position) -> bool:
+    """True when the robot's own plan continues in the direction a -> b after b."""
+    if b == a or not plan:
+        return False
+    try:
+        i = plan.index(b)
+    except ValueError:
+        return False
+    if i + 1 >= len(plan):
+        return False
+    c = plan[i + 1]
+    return (c[0] - b[0], c[1] - b[1]) == (b[0] - a[0], b[1] - a[1])
+
+
 @dataclass
 class RobotPose:
     robot_id: int
@@ -79,7 +120,7 @@ class RobotPose:
     y: float
     heading: float
     lift: float                 # 0 (down) .. 1 (raised, carrying)
-    wheel_angle: float          # accumulated wheel rotation in degrees
+    wheel_angle: float          # mean accumulated drive-wheel rotation (degrees)
     carrying: bool
     moving: bool
     reversing: bool
@@ -87,6 +128,10 @@ class RobotPose:
     waiting: bool
     yielding: bool
     cell: Position
+    wheel_left: float = 0.0     # left / right drive wheels (differential drive)
+    wheel_right: float = 0.0
+    turning: bool = False
+    speed: float = 0.0          # normalised ground speed (0 = stopped, 1 = cruise)
 
 
 @dataclass
@@ -111,8 +156,15 @@ class _RobotAnim:
     lift: float = 0.0
     wheel: float = 0.0
     last_xy: Optional[tuple[float, float]] = None
+    last_heading: float = 180.0
     anim_key: Optional[tuple] = None
     reversing: bool = False
+    wheel_l: float = 0.0
+    wheel_r: float = 0.0
+    ease_in: bool = True
+    ease_out: bool = True
+    prev_travel: Optional[float] = None
+    prev_step: int = -10
 
 
 @dataclass
@@ -182,17 +234,26 @@ class VisualSync:
                 self.robots[robot.robot_id] = anim
             a, b = robot.previous_position, robot.position
             key = (engine.step_count, a, b)
+            travel = heading_between(a, b)
             if key != anim.anim_key:
                 # A new tick began: decide how this move is animated.
                 anim.anim_key = key
                 anim.tick_start_heading = anim.heading
-                travel = heading_between(a, b)
                 anim.reversing = (
                     travel is not None and robot.is_yielding
                     and abs(abs(angle_diff(travel, anim.heading)) - 180.0) < 1.0
                 )
-            travel = heading_between(a, b)
+                # Acceleration profile: start from rest unless the robot was already
+                # cruising in this direction during the previous tick; stop at the end
+                # unless its own plan continues straight on.
+                cruising = (anim.prev_travel == travel and anim.prev_step == engine.step_count - 1
+                            and travel is not None)
+                anim.ease_in = not cruising
+                anim.ease_out = not continues_straight(robot.planned_path, a, b)
+                anim.prev_travel = travel
+                anim.prev_step = engine.step_count
             p = max(0.0, min(1.0, progress))
+            turning = False
             if travel is None:
                 move_t = 1.0
                 heading = anim.heading
@@ -200,23 +261,33 @@ class VisualSync:
                 desired = (travel + 180.0) % 360.0 if anim.reversing else travel
                 turn = angle_diff(desired, anim.tick_start_heading)
                 if abs(turn) > 1.0:
+                    # rotate in place first, then drive (always from rest)
                     turn_t = smoothstep(p / TURN_PHASE)
                     heading = anim.tick_start_heading + turn * turn_t
-                    move_t = smoothstep((p - TURN_PHASE) / (1.0 - TURN_PHASE))
+                    turning = turn_t < 1.0
+                    move_t = motion_profile((p - TURN_PHASE) / (1.0 - TURN_PHASE), True, anim.ease_out)
                 else:
                     heading = desired
-                    move_t = smoothstep(p)
+                    move_t = motion_profile(p, anim.ease_in, anim.ease_out)
             anim.heading = heading % 360.0
             cell = (a[0] + (b[0] - a[0]) * move_t, a[1] + (b[1] - a[1]) * move_t)
             x, y = world_xy(cell, h)
+            speed = 0.0
             if anim.last_xy is not None:
                 dist = math.hypot(x - anim.last_xy[0], y - anim.last_xy[1])
-                anim.wheel += (-1 if anim.reversing else 1) * dist / 0.07 * (180.0 / math.pi)
+                signed = (-1 if anim.reversing else 1) * dist / WHEEL_RADIUS * (180.0 / math.pi)
+                dturn = math.radians(angle_diff(anim.heading, anim.last_heading))
+                spin = WHEEL_TRACK * dturn / WHEEL_RADIUS * (180.0 / math.pi)
+                anim.wheel_l += signed - spin      # differential drive: turning left
+                anim.wheel_r += signed + spin      # spins the wheels in opposite directions
+                anim.wheel = (anim.wheel_l + anim.wheel_r) / 2
+                if dt > 0:
+                    speed = min(1.0, dist / dt / CRUISE_SPEED)
             anim.last_xy = (x, y)
+            anim.last_heading = anim.heading
             target_lift = 1.0 if robot.is_carrying else 0.0
             step = LIFT_SPEED * max(0.0, dt)
-            anim.lift = min(target_lift, anim.lift + step) if anim.lift < target_lift else \
-                max(target_lift, anim.lift - step)
+            anim.lift = min(target_lift, anim.lift + step) if anim.lift < target_lift else                 max(target_lift, anim.lift - step)
             poses[robot.robot_id] = RobotPose(
                 robot_id=robot.robot_id, x=x, y=y, heading=anim.heading, lift=anim.lift,
                 wheel_angle=anim.wheel % 360.0, carrying=robot.is_carrying,
@@ -224,6 +295,8 @@ class VisualSync:
                 state=robot.state,
                 waiting=robot.current_action == Action.WAIT and robot.has_task and not robot.is_yielding,
                 yielding=robot.is_yielding, cell=robot.position,
+                wheel_left=anim.wheel_l % 360.0, wheel_right=anim.wheel_r % 360.0,
+                turning=turning, speed=speed,
             )
         return poses
 
@@ -299,6 +372,13 @@ class Shot:
     duration: float = 6.0
     show_search: bool = False
     reason: str = "schedule"      # schedule | event
+    #: Cinematic framing: grid cells that must stay in view (real positions).
+    points: list = field(default_factory=list)
+    pitch: float = -40.0
+    orbit: float = 0.0            # degrees / second of slow orbit around the framed points
+    station_id: Optional[int] = None
+    kind: str = ""                # overview | tracking | follow | search | stats | pickup | deliver
+    serial: int = 0               # unique per shot (camera transitions on change)
 
 
 @dataclass
@@ -317,6 +397,7 @@ class PresentationDirector:
     seen_events: int = 0
     last_highlight_step: int = -999
     log: list[Shot] = field(default_factory=list)
+    _serial: int = 0
 
     def start(self) -> None:
         self.shot = None
@@ -328,24 +409,30 @@ class PresentationDirector:
         busy = [r for r in robots if r.has_task] or robots
         rid = busy[self.rotation_index % len(busy)].robot_id
         m = engine.metrics()
-        kind = ["overview", "follow", "search", "topdown"][self.rotation_index % 4]
+        kind = ["overview", "tracking", "follow", "search", "stats"][self.rotation_index % 5]
         self.rotation_index += 1
+        r = next(x for x in robots if x.robot_id == rid)
+        what = (f"carrying P{r.carrying} to its dock" if r.carrying is not None else
+                f"heading to parcel P{r.assigned_parcel}" if r.assigned_parcel is not None else "idle")
         if kind == "overview":
             return Shot("overview", None, "Smart Warehouse Digital Twin",
                         f"{len(robots)} autonomous robots · {m['parcels_delivered']}/{m['parcels_total']} parcels delivered",
-                        7.0)
+                        7.0, kind="overview")
+        if kind == "tracking":
+            return Shot("tracking", rid, f"Robot R{rid} · {r.state.label}", f"Tracking shot - {what}", 6.0,
+                        kind="tracking")
         if kind == "follow":
-            r = next(x for x in robots if x.robot_id == rid)
-            what = (f"carrying P{r.carrying} to its station" if r.carrying is not None else
-                    f"heading to parcel P{r.assigned_parcel}" if r.assigned_parcel is not None else "idle")
-            return Shot("follow", rid, f"Robot R{rid} · {r.state.label}", f"Tracking shot - {what}", 7.0)
+            return Shot("follow", rid, f"Robot R{rid} · third-person", f"Chase camera - {what}", 6.0, kind="follow")
         if kind == "search":
+            target = engine.warehouse.parcel_target(r)
+            route = list(r.planned_path) + ([target] if target else []) or [r.position]
             return Shot("focus", rid, f"Pathfinding · R{rid}",
-                        "BFS (blue) vs A* (orange) explored cells for the robot's current goal",
-                        8.0, show_search=True)
+                        "BFS (blue) vs A* (orange) explored cells for the robot's real goal; the dashed line is "
+                        "its planned route", 8.0, show_search=True, points=route, pitch=-62.0, orbit=3.0,
+                        kind="search")
         return Shot("topdown", None, "Performance",
                     f"Step {m['steps']} · distance {m['total_distance']} · conflicts {m['conflicts']} · "
-                    f"completion {m['completion_pct']:.0f}%", 6.0)
+                    f"completion {m['completion_pct']:.0f}%", 6.0, kind="stats")
 
     def update(self, engine: SimulationEngine, events: list[TickEvent], dt: float) -> Shot:
         self.elapsed += dt
@@ -353,14 +440,24 @@ class PresentationDirector:
         for ev in events:
             if ev.kind in ("pickup", "deliver") and ev.step - self.last_highlight_step >= 6:
                 verb = "picked up" if ev.kind == "pickup" else "delivered"
+                station = None
+                if ev.kind == "deliver":
+                    station = next((st.station_id for st in engine.warehouse.stations.values()
+                                    if st.position == ev.position), None)
                 highlight = Shot("focus", ev.robot_id, f"R{ev.robot_id} {verb} a parcel",
-                                 f"{ev.message} · step {ev.step}", 4.5, reason="event")
+                                 f"{ev.message} · step {ev.step}", 4.5, reason="event",
+                                 points=[ev.position], pitch=-30.0, orbit=9.0, station_id=station,
+                                 kind=ev.kind)
                 self.last_highlight_step = ev.step
         if highlight is not None and (self.shot is None or self.shot.reason != "event"):
             self.shot, self.elapsed = highlight, 0.0
+            self._serial += 1
+            highlight.serial = self._serial
             self.log.append(highlight)
         elif self.shot is None or self.elapsed >= self.shot.duration:
             self.shot, self.elapsed = self._scheduled(engine), 0.0
+            self._serial += 1
+            self.shot.serial = self._serial
             self.log.append(self.shot)
         self.log = self.log[-50:]
         return self.shot

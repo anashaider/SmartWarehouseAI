@@ -32,6 +32,7 @@ CHART_FILES = [
     ("chart6_conflicts", "6 · Robot conflicts"),
     ("chart7_scenario_success", "7 · Scenario-wise success"),
     ("chart8_allocation", "8 · Allocation baseline"),
+    ("chart9_utilization", "9 · Robot utilization"),
 ]
 
 FRAME_BUDGET_S = 0.030

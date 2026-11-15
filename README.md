@@ -33,7 +33,7 @@ simulation engine - nothing is hard-coded.
 
 The project has two front-ends on the same engine:
 
-- **3D digital twin (default)** - Panda3D: a realistic warehouse with racks, docks and AMR robots, shadows and post-processing, five camera modes, an opening flythrough, a command-center HUD and a Presentation Mode driven by real simulation events. See [docs/VISUALIZATION_3D.md](docs/VISUALIZATION_3D.md).
+- **3D digital twin (default)** - Panda3D: a realistic warehouse with racks, docks and AMR robots, shadows and post-processing, six camera modes, an opening flythrough, a command-center HUD with live fleet intelligence (congestion heatmap, utilisation, dock progress) and a Presentation Mode whose cinematic shots are composed around real simulation events. See [docs/VISUALIZATION_3D.md](docs/VISUALIZATION_3D.md).
 - **2D dashboard (fallback / `--2d`)** - Pygame, lightweight, starts automatically if 3D is unavailable.
 
 ## 2. Problem Statement
@@ -67,7 +67,7 @@ Environment properties: fully observable map, deterministic, discrete, sequentia
 - **Analytics screen:** runs the full experiment suite inside the app without freezing it, then shows the 8 charts and summary tables.
 - **Experiment runner (CLI):** reproducible, seeded, exports CSV + JSON + PNG charts.
 - **Robust I/O:** missing or corrupted layout/result files are detected and handled with clear messages and fallbacks.
-- **158 automated tests**, including headless tests that click the real 2D dashboard buttons and offscreen tests of the 3D digital twin.
+- **181 automated tests**, including headless tests that click the real 2D dashboard buttons and offscreen tests of the 3D digital twin.
 
 ## 4. Technology Stack
 
@@ -98,7 +98,7 @@ python main.py --screenshot out.png --ticks 25    # render the 2D dashboard to a
 python main.py --screenshot3d out.png --camera follow --quality high   # render the 3D twin offscreen
 ```
 
-3D controls: `Space` run/pause, `S` step, `R` reset, `1-3`/`Tab`/click select robot, `O` overview, `T` top-down, `F` robot tracking, `V` free camera, `G` robot focus, right-drag orbit, middle-drag pan, wheel zoom, `C` BFS vs A* explored cells, `P` Presentation Mode, `A` analytics, `H` hide HUD, `Q` graphics quality, `F1` help, `Esc` close/skip.
+3D controls: `Space` run/pause, `S` step, `R` reset, `1-3`/`Tab`/click select robot, `O` overview, `T` top-down, `K` robot tracking, `F` third-person, `V` free camera, `G` robot focus, right-drag orbit, middle-drag pan, wheel zoom, `C` BFS vs A* explored cells, `M` congestion heatmap, `I` robot status tags, `P` Presentation Mode, `A` analytics, `H` hide HUD, `Q` graphics quality, `F1` help, `Esc` close/skip.
 
 2D keyboard shortcuts: `Space` start/pause/resume, `S` step, `R` reset, `Tab`/`1-3` select robot,
 `C` BFS-vs-A* overlay, `+`/`-` speed, `A` analytics, `F1` help/legend, `Esc` quit.
@@ -106,7 +106,7 @@ python main.py --screenshot3d out.png --camera follow --quality high   # render 
 ## 7. Tests
 
 ```bash
-python -m pytest            # 158 tests, ~1 min (3D tests render offscreen; skipped without OpenGL)
+python -m pytest            # 181 tests, ~45 s (3D tests render offscreen; skipped without OpenGL)
 ```
 
 | File | Covers |
@@ -120,6 +120,7 @@ python -m pytest            # 158 tests, ~1 min (3D tests render offscreen; skip
 | `test_visual_sync.py` | 3D poses equal simulated cells, headings, lift follows carrying, effects only from real events, dock stacks, camera maths, presentation director (no GPU needed) |
 | `test_app3d.py` | offscreen 3D app: robot nodes vs simulation, pickup/delivery visuals, BFS/A* overlay, HUD pause/resume/step/reset, presentation, cameras and occlusion, picking, quality presets, analytics, intro |
 | `test_launcher.py` | 3D is the default; 2D fallback when Panda3D is unavailable |
+| `test_visual_v2.py` | motion profile, differential wheels, fleet tracker vs engine, heat decay, tick listeners, cinematic shot framing, camera transitions (no GPU needed) |
 
 ## 8. Experiments
 
@@ -173,6 +174,10 @@ Details, formulas and weights: [docs/ALGORITHMS.md](docs/ALGORITHMS.md). System 
 | ![](docs/screenshots/3d_intro.png) | ![](docs/screenshots/3d_presentation.png) |
 | **Robot tracking (third person)** | **Robot focus + utility scores** |
 | ![](docs/screenshots/3d_tracking.png) | ![](docs/screenshots/3d_focus.png) |
+| **Lift robot picking a parcel off its stand** | **Delivery: carton rolls along the dock conveyor** |
+| ![](docs/screenshots/3d_pickup.png) | ![](docs/screenshots/3d_delivery.png) |
+| **Congestion heatmap + Fleet tab** | **Robot close-up** |
+| ![](docs/screenshots/3d_heatmap_fleet.png) | ![](docs/screenshots/3d_robot_closeup.png) |
 | **BFS (blue) vs A\* (orange) explored cells** | **Analytics** |
 | ![](docs/screenshots/3d_bfs_vs_astar.png) | ![](docs/screenshots/3d_analytics.png) |
 
@@ -215,5 +220,6 @@ tools/build_layouts.py   regenerates the predefined layout JSON files
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - modules, data flow, tick algorithm, coordination
 - [docs/ALGORITHMS.md](docs/ALGORITHMS.md) - BFS, A*, agents, utility function
 - [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) - methodology, metrics, results, discussion
-- [docs/VISUALIZATION_3D.md](docs/VISUALIZATION_3D.md) - 3D digital twin design, cameras, presentation, validation
+- [docs/VISUALIZATION_3D.md](docs/VISUALIZATION_3D.md) - 3D digital twin design, cameras, presentation, intelligence, validation
+- [docs/OPTIMIZATION_V2.md](docs/OPTIMIZATION_V2.md) - V2 rendering audit and before/after measurements
 - [docs/DEMO_GUIDE.md](docs/DEMO_GUIDE.md) - live demo script and viva preparation

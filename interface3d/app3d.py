@@ -2,10 +2,12 @@
 
 Frame loop (``_update``):
     1. SimulationController.update(dt)  - fixed tick rate, independent of FPS
+       (tick listeners feed the FleetTracker once per real tick)
     2. VisualSync                        - poses / effects from the real engine state
     3. scene update                      - robots, parcels, dock stacks, overlays
     4. camera / presentation director    - camera only, never the simulation
-    5. HUD / analytics                   - text and buttons
+    5. shadow scheduling                 - re-render the shadow map only if needed
+    6. HUD / analytics                   - text and buttons (cached per tick)
 
 The simulation engine, agents, search and coordination are the unchanged
 modules used by the 2D dashboard and the experiment runner.
@@ -14,16 +16,20 @@ modules used by the 2D dashboard and the experiment runner.
 from __future__ import annotations
 
 import math
+import time
 from pathlib import Path
 from typing import Optional
 
 from panda3d.core import (
     AmbientLight,
     AntialiasAttrib,
+    BitMask32,
     DirectionalLight,
     Filename,
+    Fog,
     Point2,
     Point3,
+    TextNode,
     TextureStage,
     WindowProperties,
     loadPrcFileData,
@@ -33,20 +39,30 @@ from algorithms.pathfinder import compare
 from config.settings import AGENT_LABELS, ALGORITHM_LABELS, LAYOUT_LABELS, SimulationConfig
 from environment.parcel import ParcelStatus
 from interface3d import hud as H
-from interface3d.camera import MODE_LABELS, CameraController
-from interface3d.effects import EffectsLayer
-from interface3d.robot_model import STATE_LIGHT, WAIT_LIGHT, YIELD_LIGHT, RobotModel, build_robot
+from interface3d.camera import MODE_KEYS, MODE_LABELS, CameraController
+from interface3d.effects import EffectsLayer, HeatmapLayer
+from interface3d.geometry import MeshBuilder
+from interface3d.intelligence import FleetTracker
+from interface3d.robot_model import (LIFT_DISC_H, LIFT_REST_Z, LIFT_TRAVEL, STATE_LIGHT, WAIT_LIGHT, YIELD_LIGHT,
+                                     RobotModel, build_robot)
 from interface3d.sync import (PresentationDirector, RobotPose, Shot, VisualSync, angle_diff, damping,
                               world_xy)
-from interface3d.warehouse_scene import RACK_HEIGHT, WarehouseVisual, build_warehouse, make_carton, make_marker_ring
+from interface3d.warehouse_scene import (RACK_HEIGHT, STAND_TOP, WarehouseVisual, build_warehouse, dock_color,
+                                         make_carton, make_marker_ring)
 from simulation.simulation_controller import SimulationController
 from simulation.state_manager import SimStatus
 
+#: shadows: shadow-map size (0 = off); shadow_interval: minimum frames between
+#: shadow-map refreshes while something moves (the map is never refreshed when
+#: nothing that casts a shadow has changed).
 QUALITY_PRESETS = {
-    "low": {"shadows": 0, "msaa": False, "bloom": False, "ao": False},
-    "medium": {"shadows": 4096, "msaa": True, "bloom": True, "ao": False},
-    "high": {"shadows": 4096, "msaa": True, "bloom": True, "ao": True},
+    "low": {"shadows": 0, "shadow_interval": 0, "msaa": False, "bloom": False, "ao": False, "fog": False},
+    "medium": {"shadows": 2048, "shadow_interval": 2, "msaa": True, "bloom": True, "ao": False, "fog": True},
+    "high": {"shadows": 4096, "shadow_interval": 1, "msaa": True, "bloom": True, "ao": True, "fog": True},
 }
+SHADOW_MASK = BitMask32.bit(1)
+BANNER_SECONDS = 6.0
+TRANSFER_SECONDS = 1.6
 
 
 def configure_panda(offscreen: bool, size: tuple[int, int], title: str = "Smart Warehouse AI - 3D Digital Twin") -> None:
@@ -81,28 +97,35 @@ class WarehouseApp3D:
         b.render.setShaderAuto()
         b.render.setAntialias(AntialiasAttrib.MAuto)
         b.camLens.setFov(52)
-        b.camLens.setNearFar(0.1, 600)
+        b.camLens.setNearFar(0.25, 400)
         self.offscreen = offscreen
         self.quality = quality if quality in QUALITY_PRESETS else "medium"
         self.ctl = SimulationController(config)
         self.sync = VisualSync()
         self.director = PresentationDirector()
+        self.tracker = FleetTracker()
+        self.ctl.tick_listeners.append(self.tracker.on_tick)
         self.selected = 0
         self.show_paths = True
         self.show_compare = False
+        self.show_heatmap = False
+        self.show_indicators = True
         self.presenting = False
         self.shot: Optional[Shot] = None
         self.filters = None
         self.world = None
         self.vis: Optional[WarehouseVisual] = None
         self.robots: dict[int, RobotModel] = {}
+        self.indicators: dict[int, tuple] = {}
         self.parcel_nodes: dict[int, tuple] = {}
         self.stack_nodes: dict[int, object] = {}
         self.stack_seen: set[int] = set()
         self.transfers: list[tuple] = []
         self.effects: Optional[EffectsLayer] = None
+        self.heatmap: Optional[HeatmapLayer] = None
         self.comparison = None
         self._cmp_key = None
+        self._cmp_results = None
         self._scene_key = None
         self._mouse_last: Optional[tuple[float, float]] = None
         self._drag: Optional[str] = None
@@ -111,6 +134,20 @@ class WarehouseApp3D:
         self.help_root = None
         self._occl_pitch = 0.0
         self._occl_heading = 0.0
+        self._tick_cache_step = -1
+        self._metrics: dict = {}
+        self._parcel_views: list = []
+        self._stacks: dict = {}
+        self._banner_msg = ""
+        self._banner_time = -1e9
+        self._last_ctl_message = ""
+        self._shadow_sig = None
+        self._shadow_force = True
+        self._shadow_last_frame = -999
+        self.shadow_updates = 0
+        self.fog = Fog("depth-fog")
+        self.fog.setColor(0.02, 0.03, 0.05)
+        self.fog.setExpDensity(0.004)
 
         self._setup_lights()
         self.hud = H.Hud(b, self)
@@ -129,46 +166,73 @@ class WarehouseApp3D:
     def _setup_lights(self) -> None:
         r = self.base.render
         amb = AmbientLight("ambient")
-        amb.setColor((0.26, 0.28, 0.34, 1))
+        amb.setColor((0.25, 0.28, 0.34, 1))
         r.setLight(r.attachNewNode(amb))
         sun = DirectionalLight("sun")
-        sun.setColor((0.78, 0.75, 0.70, 1))
+        sun.setColor((0.80, 0.76, 0.70, 1))
+        sun.setCameraMask(SHADOW_MASK)      # the shadow camera only sees shadow casters
         self.sun = r.attachNewNode(sun)
         self.sun.setHpr(-32, -58, 0)
         r.setLight(self.sun)
         fill = DirectionalLight("fill")
-        fill.setColor((0.20, 0.24, 0.32, 1))
+        fill.setColor((0.18, 0.22, 0.30, 1))
         fnp = r.attachNewNode(fill)
         fnp.setHpr(150, -35, 0)
         r.setLight(fnp)
 
-    def rebuild_scene(self) -> None:
-        """(Re)build the 3D world for the current scenario / robot count."""
+    def _clear_scene(self) -> None:
+        """Release every node of the previous scene (layout change / reset)."""
+        if self.effects is not None:
+            self.effects.destroy()
+            self.effects = None
+        if self.heatmap is not None:
+            self.heatmap.destroy()
+            self.heatmap = None
         if self.world is not None:
             self.world.removeNode()
+            self.world = None
+        self.robots.clear()
+        self.indicators.clear()
+        self.parcel_nodes.clear()
+        self.stack_nodes.clear()
+        self.stack_seen.clear()
+        self.transfers.clear()
+
+    def rebuild_scene(self) -> None:
+        """(Re)build the 3D world for the current scenario / robot count."""
+        self._clear_scene()
         b = self.base
         engine = self.ctl.engine
         self.world = b.render.attachNewNode("world")
         self.vis = build_warehouse(self.ctl.scenario, self.world, self.quality)
+        for np_ in self.vis.no_shadow:
+            np_.hide(SHADOW_MASK)
         h = engine.warehouse.grid.height
-        self.robots = {r.robot_id: build_robot(r.robot_id, self.world) for r in engine.warehouse.robots}
-        self.parcel_nodes = {}
+        self.robots = {r.robot_id: build_robot(r.robot_id, self.world, self.hud.bold)
+                       for r in engine.warehouse.robots}
+        for m in self.robots.values():
+            for np_ in (m.halo, m.select_ring, m.select_beam, m.status):
+                np_.hide(SHADOW_MASK)
+            self.indicators[m.robot_id] = self._make_indicator(m)
         for p in engine.warehouse.parcels.values():
-            node = make_carton(f"parcel-{p.parcel_id}")
+            node = make_carton(f"parcel-{p.parcel_id}", label_color=dock_color(p.destination_id))
             node.reparentTo(self.world)
             x, y = world_xy(p.origin, h)
-            node.setPos(x, y, 0.0)
+            node.setPos(x, y, STAND_TOP)
             ring = make_marker_ring((1, 1, 1, 0.9), 0.3, 0.36)
             ring.reparentTo(self.world)
             ring.setPos(x, y, 0.011)
             ring.hide()
+            ring.hide(SHADOW_MASK)
             self.parcel_nodes[p.parcel_id] = (node, ring)
-        self.stack_nodes = {}
-        self.stack_seen = set()
-        self.transfers = []
         self.effects = EffectsLayer(self.world, h)
+        self.effects.root.hide(SHADOW_MASK)
+        self.heatmap = HeatmapLayer(self.world, engine.warehouse.grid, h)
+        self.heatmap.root.hide(SHADOW_MASK)
         self._cmp_key = None
+        self._tick_cache_step = -1
         self.sync.reset()
+        self.tracker.reset()
         cx, cy = self.vis.center
         if not hasattr(self, "camera"):
             self.camera = CameraController((cx, cy), self.vis.extent)
@@ -179,7 +243,6 @@ class WarehouseApp3D:
             self.camera.mode = mode if mode != "free" else "overview"
             if was_intro:
                 self._end_intro()
-        # shadow camera covers the warehouse
         lens = self.sun.node().getLens()
         gw, gh = self.vis.width + 2 * 2.5 + 1, self.vis.height + 2 * 2.5 + 1
         lens.setFilmSize(gw * 1.05, gh * 1.25)
@@ -187,8 +250,44 @@ class WarehouseApp3D:
         self.sun.setPos(cx, cy, 0)
         self.sun.setPos(self.sun, 0, -50, 0)
         self._scene_key = (id(self.ctl.scenario), len(engine.warehouse.robots))
+        self._shadow_force = True
 
-    # ================================================================== quality
+    def _make_indicator(self, m: RobotModel) -> tuple:
+        """Floating status tag above a robot: name, activity and utilisation bar."""
+        root = m.root.attachNewNode("indicator")
+        root.setZ(1.05)
+        root.setBillboardPointEye()
+        root.setLightOff(1)
+        root.setShaderOff(1)
+        root.setDepthWrite(False)
+        root.setBin("fixed", 30)
+        root.hide(SHADOW_MASK)
+        bg = MeshBuilder("tag")
+        bg.quad((-0.3, 0, -0.01), (0.3, 0, -0.01), (0.3, 0, 0.15), (-0.3, 0, 0.15), (0, -1, 0),
+                (0.03, 0.05, 0.09, 0.8))
+        bg.quad((-0.3, 0, -0.01), (-0.28, 0, -0.01), (-0.28, 0, 0.15), (-0.3, 0, 0.15), (0, -1, 0), m.accent)
+        bnp = root.attachNewNode(bg.node())
+        from panda3d.core import TransparencyAttrib
+        bnp.setTransparency(TransparencyAttrib.MAlpha)
+        tn = TextNode(f"tag-{m.robot_id}")
+        tn.setAlign(TextNode.ALeft)
+        tn.setTextColor(1, 1, 1, 1)
+        if self.hud.bold is not None:
+            tn.setFont(self.hud.bold)
+        tnp = root.attachNewNode(tn)
+        tnp.setScale(0.11)
+        tnp.setPos(-0.34, -0.001, 0.085)
+        bar_bg = MeshBuilder("bar-bg")
+        bar_bg.quad((-0.34, 0, 0.02), (0.36, 0, 0.02), (0.36, 0, 0.055), (-0.34, 0, 0.055), (0, -1, 0),
+                    (0.2, 0.25, 0.35, 1))
+        root.attachNewNode(bar_bg.node()).setY(-0.001)
+        bar = MeshBuilder("bar")
+        bar.quad((0, 0, 0.02), (0.7, 0, 0.02), (0.7, 0, 0.055), (0, 0, 0.055), (0, -1, 0), (1, 1, 1, 1))
+        bar_np = root.attachNewNode(bar.node())
+        bar_np.setPos(-0.34, -0.002, 0)
+        return root, tn, bar_np
+
+    # ================================================================== quality / shadows
     def apply_quality(self, quality: str) -> None:
         self.quality = quality if quality in QUALITY_PRESETS else "medium"
         preset = QUALITY_PRESETS[self.quality]
@@ -197,6 +296,11 @@ class WarehouseApp3D:
             sun.setShadowCaster(True, preset["shadows"], preset["shadows"])
         else:
             sun.setShadowCaster(False)
+        self._shadow_force = True
+        if preset["fog"]:
+            self.base.render.setFog(self.fog)
+        else:
+            self.base.render.clearFog()
         if self.filters is not None:
             self.filters.cleanup()
             self.filters = None
@@ -209,17 +313,50 @@ class WarehouseApp3D:
                     ok = f.setMSAA(4) is not False and ok
                 if preset["bloom"]:
                     ok = f.setBloom(blend=(0.3, 0.4, 0.3, 0.0), mintrigger=0.72, maxtrigger=1.0, desat=0.5,
-                                    intensity=0.55, size="medium") is not False and ok
+                                    intensity=0.55, size="small") is not False and ok
                 if preset["ao"]:
                     ok = f.setAmbientOcclusion(numsamples=16, radius=0.06, amount=1.6, strength=0.012,
                                                falloff=0.000002) is not False and ok
                 self.filters = f
                 if not ok:
-                    self.ctl.message = "Some post-processing effects are not supported on this GPU."
+                    self.notify("Some post-processing effects are not supported on this GPU.")
             except Exception as exc:  # noqa: BLE001 - degrade gracefully on unsupported GPUs
                 self.filters = None
-                self.ctl.message = f"Post-processing disabled: {exc}"
+                self.notify(f"Post-processing disabled: {exc}")
         self._layout()
+
+    def _shadow_buffer(self):
+        if not self.sun.node().isShadowCaster():
+            return None
+        try:
+            return self.sun.node().getShadowBuffer(self.base.win.getGsg())
+        except Exception:  # noqa: BLE001 - buffer not created yet
+            return None
+
+    def _schedule_shadows(self, poses: dict[int, RobotPose]) -> None:
+        """Re-render the shadow map only when a shadow caster moved/changed.
+
+        Static racks never change, so a paused or idle warehouse costs no shadow
+        pass at all; while robots move the map refreshes at most every
+        ``shadow_interval`` frames (quality preset).
+        """
+        buf = self._shadow_buffer()
+        if buf is None:
+            return
+        sig = (tuple((round(p.x, 3), round(p.y, 3), round(p.heading, 1), round(p.lift, 2), p.carrying)
+                     for p in poses.values()),
+               tuple(not n.isHidden() for n, _ in self.parcel_nodes.values()),
+               len(self.stack_nodes), bool(self.transfers))
+        interval = QUALITY_PRESETS[self.quality]["shadow_interval"] or 1
+        changed = sig != self._shadow_sig
+        due = self.frame_count - self._shadow_last_frame >= interval
+        active = self._shadow_force or (changed and due)
+        buf.setActive(active)
+        if active:
+            self._shadow_sig = sig
+            self._shadow_last_frame = self.frame_count
+            self._shadow_force = False
+            self.shadow_updates += 1
 
     # ================================================================== layout
     def _window_size(self) -> tuple[int, int]:
@@ -278,14 +415,15 @@ class WarehouseApp3D:
         hud.text("p:sub", "", 50, h - bar - 54, 15, H.TEXT2, wrap=w * 0.6)
         hud.text("p:stats", "", w / 2, h - bar / 2 - 8, 14, H.TEXT, align="center", bold=True)
         hud.text("p:hint", "P / Esc  exit presentation", w - 30, h - bar / 2 - 6, 11, H.MUTED, align="right")
+        hud.finalize(root)
         hud.root = saved
         self.presentation_root = root
-        if not self.presenting:
+        if not (self.presenting or self.camera.in_intro):
             root.hide()
 
     # ================================================================== opening sequence
     def start_intro(self) -> None:
-        """Letterboxed opening flythrough; the command-center HUD fades in afterwards."""
+        """Letterboxed opening flythrough; the command-center HUD appears afterwards."""
         self.hud.set_visible(False)
         self.presentation_root.show()
         self.camera.start_intro(self._end_intro)
@@ -296,6 +434,12 @@ class WarehouseApp3D:
             self.presentation_root.hide()
             self.hud.set_visible(True)
         self._apply_film_offset()
+
+    # ================================================================== messages
+    def notify(self, message: str) -> None:
+        """Timed banner message (warnings / errors shown to the user)."""
+        self._banner_msg = message
+        self._banner_time = self.time
 
     # ================================================================== commands (HUD / keys)
     def cmd_start(self) -> None:
@@ -320,17 +464,38 @@ class WarehouseApp3D:
         self.ctl.reset()
         self.rebuild_scene()
 
+    def _with_loading(self, message: str, action) -> None:
+        """Show a loading card for the (synchronous) scene rebuild."""
+        overlay = None
+        if self.hud.size != (0, 0):
+            overlay = self.hud.show_loading(message)
+            self.base.graphicsEngine.renderFrame()
+        try:
+            action()
+        finally:
+            if overlay is not None:
+                overlay.removeNode()
+
     def cmd_config(self, **changes) -> None:
-        self.ctl.apply_config(**changes)
-        self.selected = min(self.selected, self.ctl.config.num_robots - 1)
-        self.rebuild_scene()
+        from config.settings import LAYOUT_LABELS as LL
+        target = LL.get(changes.get("layout", self.ctl.config.layout), "warehouse")
+
+        def apply() -> None:
+            self.ctl.apply_config(**changes)
+            self.selected = min(self.selected, self.ctl.config.num_robots - 1)
+            self.rebuild_scene()
+
+        self._with_loading(f"Loading {target}", apply)
 
     def cmd_speed(self, index: int) -> None:
         self.ctl.set_speed_index(index)
 
     def cmd_quality(self, quality: str) -> None:
-        self.apply_quality(quality)
-        self.rebuild_scene()
+        def apply() -> None:
+            self.apply_quality(quality)
+            self.rebuild_scene()
+
+        self._with_loading(f"Graphics quality: {quality.title()}", apply)
 
     def cmd_select(self, robot_id: int) -> None:
         if robot_id < len(self.ctl.engine.warehouse.robots):
@@ -346,6 +511,12 @@ class WarehouseApp3D:
     def cmd_toggle_compare(self) -> None:
         self.show_compare = not self.show_compare
         self._cmp_key = None
+
+    def cmd_toggle_heatmap(self) -> None:
+        self.show_heatmap = not self.show_heatmap
+
+    def cmd_toggle_indicators(self) -> None:
+        self.show_indicators = not self.show_indicators
 
     def cmd_toggle_hud(self) -> None:
         if self.presenting:
@@ -396,21 +567,25 @@ class WarehouseApp3D:
         root = self.base.pixel2d.attachNewNode("help")
         saved = hud.root
         hud.root = root
-        bw, bh = 620, 470
+        bw, bh = 640, 560
         x, y = (w - bw) / 2, (h - bh) / 2
-        hud._frame(0, 0, w, h, (0, 0, 0, 0.55))
+        hud._frame(0, 0, w, h, (0, 0, 0, 0.6))
         hud._frame(x, y, bw, bh, H.PANEL_SOLID)
-        hud.text(None, "Controls", x + 24, y + 20, 20, H.TEXT, bold=True)
+        hud._frame(x, y, bw, 3, H.ACCENT)
+        hud.text(None, "Keyboard & mouse", x + 24, y + 20, 20, H.TEXT, bold=True)
+        cams = "  ".join(f"{MODE_KEYS[m]} {MODE_LABELS[m]}" for m in MODE_KEYS)
         lines = [("Space", "start / pause / resume"), ("S", "step one tick"), ("R", "reset scenario"),
-                 ("1 2 3 / Tab", "select robot (or click it)"), ("O T F V G", "overview / top-down / follow / free / focus"),
+                 ("1 2 3 / Tab", "select robot (or click it)"), ("Cameras", cams),
                  ("Right drag", "orbit camera"), ("Middle drag", "pan camera"), ("Wheel", "zoom"),
-                 ("C", "BFS vs A* explored cells"), ("P", "presentation mode"), ("A", "analytics"),
-                 ("H", "hide HUD"), ("Q", "graphics quality"), ("+ / -", "simulation speed"), ("Esc", "close / exit")]
+                 ("C", "BFS vs A* explored cells"), ("M", "congestion heatmap"), ("I", "robot status tags"),
+                 ("P", "presentation mode"), ("A", "analytics"), ("H", "hide HUD"), ("Q", "graphics quality"),
+                 ("+ / -", "simulation speed"), ("Esc", "close / skip / exit")]
         yy = y + 64
         for k, v in lines:
             hud.text(None, k, x + 28, yy, 13, H.ACCENT_HOVER, bold=True)
-            hud.text(None, v, x + 190, yy, 13, H.TEXT2)
-            yy += 24
+            hud.text(None, v, x + 170, yy, 13, H.TEXT2, wrap=bw - 200)
+            yy += 26 if k != "Cameras" else 44
+        hud.finalize(root)
         hud.root = saved
         self.help_root = root
 
@@ -423,9 +598,11 @@ class WarehouseApp3D:
         acc("tab", lambda: self.cmd_select((self.selected + 1) % len(self.ctl.engine.warehouse.robots)))
         for i in range(3):
             acc(str(i + 1), lambda i=i: self.cmd_select(i))
-        for key, mode in (("o", "overview"), ("t", "topdown"), ("f", "follow"), ("v", "free"), ("g", "focus")):
-            acc(key, lambda m=mode: self.cmd_camera(m))
+        for mode, key in MODE_KEYS.items():
+            acc(key.lower(), lambda m=mode: self.cmd_camera(m))
         acc("c", self.cmd_toggle_compare)
+        acc("m", self.cmd_toggle_heatmap)
+        acc("i", self.cmd_toggle_indicators)
         acc("p", self.cmd_presentation)
         acc("a", self.cmd_analytics)
         acc("h", self.cmd_toggle_hud)
@@ -440,8 +617,8 @@ class WarehouseApp3D:
         acc("mouse3-up", self._end_drag)
         acc("mouse2", lambda: self._start_drag("pan"))
         acc("mouse2-up", self._end_drag)
-        acc("wheel_up", lambda: self.camera.zoom(0.88))
-        acc("wheel_down", lambda: self.camera.zoom(1.14))
+        acc("wheel_up", lambda: self._zoom(0.88))
+        acc("wheel_down", lambda: self._zoom(1.14))
         acc("window-event", self._on_window_event)
 
     def _mouse(self) -> Optional[tuple[float, float]]:
@@ -451,7 +628,22 @@ class WarehouseApp3D:
         m = mw.getMouse()
         return (m.getX(), m.getY())
 
+    def _mouse_pixels(self, m: tuple[float, float]) -> tuple[float, float]:
+        w, h = self._window_size()
+        return ((m[0] + 1) / 2 * w, (1 - m[1]) / 2 * h)
+
+    def _over_ui(self) -> bool:
+        m = self._mouse()
+        return m is not None and (self.analytics.visible or self.hud.blocks(*self._mouse_pixels(m)))
+
+    def _zoom(self, factor: float) -> None:
+        if not self._over_ui():
+            self.camera.skip_intro()
+            self.camera.zoom(factor)
+
     def _start_drag(self, kind: str) -> None:
+        if self._over_ui():
+            return
         self.camera.skip_intro()
         self._drag = kind
         self._mouse_last = self._mouse()
@@ -464,7 +656,7 @@ class WarehouseApp3D:
             self.camera.skip_intro()
             return
         m = self._mouse()
-        if m is None or self.analytics.visible:
+        if m is None or self._over_ui():
             return
         rid = self.pick_robot(m)
         if rid is not None:
@@ -496,6 +688,16 @@ class WarehouseApp3D:
         self._update(dt)
         return task.cont
 
+    def _refresh_tick_cache(self, engine) -> None:
+        """Data that only changes when the simulation ticks (computed once per tick)."""
+        if engine.step_count == self._tick_cache_step:
+            return
+        self._tick_cache_step = engine.step_count
+        self._metrics = engine.metrics()
+        self._parcel_views = self.sync.parcel_views(engine)
+        self._stacks = self.sync.delivered_per_station(engine)
+        self._dock_progress = self.tracker.station_progress(engine)
+
     def _update(self, dt: float) -> None:
         self.time += dt
         self.frame_count += 1
@@ -505,8 +707,11 @@ class WarehouseApp3D:
         engine = ctl.engine
         if (id(ctl.scenario), len(engine.warehouse.robots)) != self._scene_key:
             self.rebuild_scene()
+        if engine.step_count < self.tracker.last_step:
+            self.tracker.reset()
         if events:
             self.sync.ingest_events(engine, events, now)
+        self._refresh_tick_cache(engine)
         poses = self.sync.robot_poses(engine, ctl.animation_progress(), dt)
         self.selected = min(self.selected, len(engine.warehouse.robots) - 1)
 
@@ -515,39 +720,49 @@ class WarehouseApp3D:
             if self.shot.robot_id is not None:
                 self.selected = self.shot.robot_id
 
-        self._update_robots(poses, now)
+        self._update_robots(engine, poses, now)
         self._update_parcels(engine, poses, now)
         self._update_overlays(engine, poses, now)
-        self._update_camera(dt, poses)
+        self._update_camera(dt, poses, engine)
+        self._schedule_shadows(poses)
         self._update_hud(engine)
         self.analytics.update()
 
     # ------------------------------------------------------------------ robots
-    def _update_robots(self, poses: dict[int, RobotPose], now: float) -> None:
+    def _update_robots(self, engine, poses: dict[int, RobotPose], now: float) -> None:
+        origins = {p.origin: p.parcel_id for p in engine.warehouse.parcels.values()}
         for rid, pose in poses.items():
             m = self.robots.get(rid)
             if m is None:
                 continue
             m.root.setPos(pose.x, pose.y, 0.0)
             m.root.setH(pose.heading)
-            for wnode in m.wheels:
-                wnode.setP(pose.wheel_angle)
-            m.lidar.setH((now * (540 if pose.moving else 220)) % 360)
-            m.lift.setZ(0.245 + 0.2 * pose.lift)
+            for wnode in m.wheels_left:
+                wnode.setP(pose.wheel_left)
+            for wnode in m.wheels_right:
+                wnode.setP(pose.wheel_right)
+            m.lidar.setH((now * (720 if pose.moving else 300)) % 360)
+            lift_z = LIFT_REST_Z + LIFT_TRAVEL * pose.lift
+            m.lift.setZ(lift_z)
             if pose.carrying:
                 m.cargo.show()
+                # While still under its parcel stand, the carton rests on the stand
+                # until the rising platform reaches it.
+                robot = engine.warehouse.robots[rid]
+                on_stand = origins.get(pose.cell) == robot.carrying
+                top = lift_z + LIFT_DISC_H
+                m.cargo.setZ(LIFT_DISC_H + (max(0.0, STAND_TOP - top) if on_stand else 0.0))
             else:
                 m.cargo.hide()
-            # gentle suspension bob while driving
-            m.body.setZ(0.006 * math.sin(now * 18) if pose.moving else 0.0)
+            m.body.setZ(0.004 * math.sin(now * 22) * pose.speed)        # suspension vibration while driving
             if pose.yielding:
                 col, pulse = YIELD_LIGHT, 0.5 + 0.5 * math.sin(now * 8)
             elif pose.waiting:
-                col, pulse = WAIT_LIGHT, 1.0 if int(now * 3) % 2 == 0 else 0.25
+                col, pulse = WAIT_LIGHT, 1.0 if int(now * 3) % 2 == 0 else 0.2
             else:
                 col, pulse = STATE_LIGHT[pose.state.value], 0.85 + 0.15 * math.sin(now * 2.5)
-            m.status.setColorScale(col[0] * (0.4 + pulse), col[1] * (0.4 + pulse), col[2] * (0.4 + pulse), 1)
-            m.halo.show()
+            k = 0.45 + 0.75 * pulse
+            m.status.setColorScale(col[0] * k, col[1] * k, col[2] * k, 1)
             if pose.waiting or pose.yielding:
                 m.halo.setColorScale(col[0], col[1], col[2], 0.35 + 0.45 * pulse)
                 s = 1.0 + 0.08 * math.sin(now * 5)
@@ -556,16 +771,44 @@ class WarehouseApp3D:
                 m.halo.setColorScale(a[0], a[1], a[2], 0.38)
                 s = 1.0
             m.halo.setScale(s, s, 1)
-            if rid == self.selected:
+            selected = rid == self.selected
+            if selected:
                 m.select_ring.show()
                 a = m.accent
-                m.select_ring.setColorScale(a[0], a[1], a[2], 0.6 + 0.3 * math.sin(now * 4))
+                glow = 0.6 + 0.3 * math.sin(now * 4)
+                m.select_ring.setColorScale(a[0], a[1], a[2], glow)
+                if not self.presenting:
+                    m.select_beam.show()
+                    m.select_beam.setColorScale(a[0], a[1], a[2], 0.5 + 0.3 * math.sin(now * 3))
+                else:
+                    m.select_beam.hide()
             else:
                 m.select_ring.hide()
+                m.select_beam.hide()
+            self._update_indicator(engine, rid, pose)
+
+    def _update_indicator(self, engine, rid: int, pose: RobotPose) -> None:
+        root, tn, bar = self.indicators[rid]
+        close_up = self.presenting or self.camera.mode in ("follow", "tracking", "focus")
+        if not self.show_indicators or (close_up and rid == self.selected):
+            root.hide()
+            return
+        root.show()
+        robot = engine.warehouse.robots[rid]
+        usage = self.tracker.usage.get(rid)
+        act = usage.current if usage else ("idle" if not robot.has_task else "moving")
+        util = self.tracker.utilization(rid)
+        label = f"R{rid}  {act.upper()}"
+        if tn.getText() != label:
+            tn.setText(label)
+            col = H.ACTIVITY_COLORS[act]
+            bar.setColorScale(col[0], col[1], col[2], 1)
+        bar.setSx(max(0.01, util))
+        root.setZ(1.05 + (0.25 if pose.carrying else 0.0))
 
     # ------------------------------------------------------------------ parcels and dock stacks
     def _update_parcels(self, engine, poses: dict[int, RobotPose], now: float) -> None:
-        for view in self.sync.parcel_views(engine):
+        for view in self._parcel_views:
             node, ring = self.parcel_nodes[view.parcel_id]
             if view.visible_on_floor:
                 node.show()
@@ -578,11 +821,10 @@ class WarehouseApp3D:
             else:
                 node.hide()
                 ring.hide()
-        # Delivered parcels: a carton flies from the delivering robot's lift to the
-        # dock pallet (0.8 s arc), then stays stacked. Triggered by the real
-        # DELIVERED status, so the animation never precedes the simulated action.
-        stacks = self.sync.delivered_per_station(engine)
-        for sid, pids in stacks.items():
+        # Delivered parcels: the carton moves from the robot's lift onto the dock
+        # conveyor, rolls along it and drops onto the pallet stack. Triggered by
+        # the real DELIVERED status in the tick it happened.
+        for sid, pids in self._stacks.items():
             st = self.vis.stations.get(sid) if self.vis else None
             if st is None:
                 continue
@@ -590,39 +832,56 @@ class WarehouseApp3D:
                 if pid in self.stack_nodes:
                     continue
                 slot = (((k % 4) % 2 - 0.5) * 0.42, ((k % 4) // 2 - 0.5) * 0.42, (k // 4) * 0.3)
-                box = make_carton(f"stacked-{pid}", size=0.34)
+                parcel = engine.warehouse.parcels[pid]
+                box = make_carton(f"stacked-{pid}", size=0.34, label_color=dock_color(sid))
                 box.reparentTo(st.stack_anchor)
                 box.setPos(*slot)
                 self.stack_nodes[pid] = box
-                parcel = engine.warehouse.parcels[pid]
                 if pid not in self.stack_seen and parcel.delivered_step == engine.step_count:
                     deliverer = next((r for r in engine.warehouse.robots
                                       if r.delivery_history and r.delivery_history[-1].parcel_id == pid), None)
                     if deliverer is not None and deliverer.robot_id in poses:
                         p = poses[deliverer.robot_id]
-                        self.transfers.append((box, (p.x, p.y, 0.55), slot, now))
+                        start = (p.x, p.y, LIFT_REST_Z + LIFT_TRAVEL * p.lift + LIFT_DISC_H)
+                        self.transfers.append((box, start, st.conveyor_start, st.conveyor_end, slot, now))
                 self.stack_seen.add(pid)
         alive = []
-        for box, start, slot, t0 in self.transfers:
+        for box, start, c0, c1, slot, t0 in self.transfers:
             if box.isEmpty():
                 continue
-            t = (now - t0) / 0.8
+            t = (now - t0) / TRANSFER_SECONDS
             if t >= 1.0:
                 box.setPos(*slot)
                 continue
-            k = t * t * (3 - 2 * t)
             anchor = box.getParent().getPos(self.base.render)
-            ex, ey, ez = anchor.x + slot[0], anchor.y + slot[1], anchor.z + slot[2]
-            box.setPos(self.base.render, start[0] + (ex - start[0]) * k, start[1] + (ey - start[1]) * k,
-                       start[2] + (ez - start[2]) * k + math.sin(math.pi * k) * 0.6)
-            alive.append((box, start, slot, t0))
+            end = (anchor.x + slot[0], anchor.y + slot[1], anchor.z + slot[2])
+            if t < 0.25:                                 # lift -> conveyor head
+                k = t / 0.25
+                k = k * k * (3 - 2 * k)
+                pos = tuple(a + (b - a) * k for a, b in zip(start, c0))
+                pos = (pos[0], pos[1], pos[2] + math.sin(math.pi * k) * 0.15)
+            elif t < 0.7:                                # rolls along the conveyor
+                k = (t - 0.25) / 0.45
+                pos = tuple(a + (b - a) * k for a, b in zip(c0, c1))
+            else:                                        # onto the pallet stack
+                k = (t - 0.7) / 0.3
+                k = k * k * (3 - 2 * k)
+                pos = tuple(a + (b - a) * k for a, b in zip(c1, end))
+                pos = (pos[0], pos[1], pos[2] + math.sin(math.pi * k) * 0.3)
+            box.setPos(self.base.render, *pos)
+            alive.append((box, start, c0, c1, slot, t0))
         self.transfers = alive
         if self.vis:
             for belt in self.vis.belts:
                 belt.setTexOffset(TextureStage.getDefault(), 0, -now * 0.6)
             for st in self.vis.stations.values():
                 pulse = 0.6 + 0.4 * math.sin(now * 2 + st.station_id)
-                st.beacon.setColorScale(pulse, 1, pulse, 1)
+                st.beacon.setColorScale(pulse, pulse, pulse, 1)
+                done, total = self._dock_progress.get(st.station_id, (0, 0))
+                label = f"D{st.station_id}   {done} / {total}"
+                if st.sign_text is not None and st.sign_text.getText() != label:
+                    st.sign_text.setText(label)
+                    st.progress_fill.setSx(max(0.001, done / total if total else 0.0))
 
     # ------------------------------------------------------------------ overlays
     def _update_overlays(self, engine, poses: dict[int, RobotPose], now: float) -> None:
@@ -647,17 +906,47 @@ class WarehouseApp3D:
             self.comparison = self._cmp_results
         fx.animate_comparison(show_search and self.comparison is not None, now)
         fx.update_events(self.sync.live_effects(now), now)
+        if self.heatmap is not None:
+            self.heatmap.set_visible(self.show_heatmap)
+            if self.show_heatmap:
+                self.heatmap.update(self.tracker.heat, self.tracker.version)
 
     # ------------------------------------------------------------------ camera
-    def _update_camera(self, dt: float, poses: dict[int, RobotPose]) -> None:
-        override = None
+    def _shot_goal(self, engine, poses: dict[int, RobotPose]):
+        """Cinematic framing of real positions for event / pathfinding shots."""
+        shot = self.shot
+        if shot is None or not shot.points:
+            return None
+        h = engine.warehouse.grid.height
+        pts = [world_xy(c, h) for c in shot.points]
+        if shot.robot_id in poses:
+            p = poses[shot.robot_id]
+            pts.append((p.x, p.y))
+        if shot.station_id is not None and self.vis and shot.station_id in self.vis.stations:
+            st = self.vis.stations[shot.station_id]
+            pts.append(st.conveyor_end[:2])
+            anchor = st.stack_anchor.getPos(self.base.render)
+            pts.append((anchor.x, anchor.y))
+        base_heading = -25.0 + 7.0 * (shot.serial % 5)
+        heading = base_heading + shot.orbit * self.director.elapsed
+        margin = 1.6 if shot.kind in ("pickup", "deliver") else 1.15
+        return self.camera.frame_points(pts, shot.pitch, heading, margin=margin,
+                                        min_distance=4.5 if shot.kind in ("pickup", "deliver") else 8.0)
+
+    def _update_camera(self, dt: float, poses: dict[int, RobotPose], engine) -> None:
+        override = goal = key = None
         if self.presenting and self.shot is not None:
             override = self.shot.mode
+            goal = self._shot_goal(engine, poses)
+            key = ("shot", self.shot.serial)
         pose = poses.get(self.selected)
         rp = (pose.x, pose.y, pose.heading) if pose else None
-        rig = self.camera.update(dt, self.time, rp, override)
-        tracking = self.presenting or self.camera.mode == "follow"
+        rig = self.camera.update(dt, self.time, rp, override, goal, key)
+        tracking = self.presenting or self.camera.mode in ("follow", "tracking")
         view = self._unoccluded(rig, dt, allow_turn=tracking and not self.camera.in_intro)
+        if self.vis is not None and self.vis.overhead is not None:
+            # roof trusses would cut across plan views: hide them when looking steeply down
+            (self.vis.overhead.hide if view.pitch < -68 else self.vis.overhead.show)()
         cam = self.base.camera
         cam.setPos(*view.camera_position())
         cam.lookAt(view.tx, view.ty, view.tz)
@@ -724,30 +1013,34 @@ class WarehouseApp3D:
         ctl = self.ctl
         cfg = ctl.config
         st = ctl.status.value
-        m = engine.metrics()
+        m = self._metrics
+        if ctl.message and ctl.message != self._last_ctl_message:
+            self.notify(ctl.message)
+        self._last_ctl_message = ctl.message
         if self.camera.in_intro:
             sc = self.ctl.scenario
-            self.hud.set_text("p:title", "Smart Warehouse AI")
-            self.hud.set_text("p:sub", f"{sc.name} · {len(engine.warehouse.robots)} autonomous robots · "
-                                       f"{len(engine.warehouse.parcels)} parcels · BFS & A* · Simple Reflex, "
-                                       "Goal-Based and Utility-Based agents")
-            self.hud.set_text("p:live", "OPENING SEQUENCE  ·  click or press Esc to skip", H.TEXT2)
-            self.hud.set_text("p:stats", "")
-            self.hud.set_text("p:mode", "SMART WAREHOUSE AI  ·  3D DIGITAL TWIN")
-            self.hud.set_text("p:hint", "")
+            hud.set_text("p:title", "Smart Warehouse AI")
+            hud.set_text("p:sub", f"{sc.name} · {len(engine.warehouse.robots)} autonomous robots · "
+                                  f"{len(engine.warehouse.parcels)} parcels · BFS & A* · Simple Reflex, "
+                                  "Goal-Based and Utility-Based agents")
+            hud.set_text("p:live", "OPENING SEQUENCE  ·  click or press Esc to skip", H.TEXT2)
+            hud.set_text("p:stats", "")
+            hud.set_text("p:mode", "SMART WAREHOUSE AI  ·  3D DIGITAL TWIN")
+            hud.set_text("p:hint", "")
             return
         if self.presenting:
-            self.hud.set_text("p:mode", "SMART WAREHOUSE AI  ·  PRESENTATION MODE")
-            self.hud.set_text("p:hint", "P / Esc  exit presentation")
+            hud.set_text("p:mode", "SMART WAREHOUSE AI  ·  PRESENTATION MODE")
+            hud.set_text("p:hint", "P / Esc  exit presentation")
             shot = self.shot
-            self.hud.set_text("p:title", shot.caption if shot else "")
-            self.hud.set_text("p:sub", shot.subcaption if shot else "")
-            self.hud.set_text("p:live", f"{st}  ·  STEP {engine.step_count}  ·  "
-                                        f"{AGENT_LABELS[cfg.agent_type].upper()} / {ALGORITHM_LABELS[cfg.algorithm]}",
-                              H.STATUS_COLORS[st])
-            self.hud.set_text("p:stats", f"DELIVERED {m['parcels_delivered']}/{m['parcels_total']}     "
-                                         f"DISTANCE {m['total_distance']}     CONFLICTS {m['conflicts']}     "
-                                         f"COMPLETION {m['completion_pct']:.0f}%")
+            hud.set_text("p:title", shot.caption if shot else "")
+            hud.set_text("p:sub", shot.subcaption if shot else "")
+            hud.set_text("p:live", f"{st}  ·  STEP {engine.step_count}  ·  "
+                                   f"{AGENT_LABELS[cfg.agent_type].upper()} / {ALGORITHM_LABELS[cfg.algorithm]}",
+                         H.STATUS_COLORS[st])
+            hud.set_text("p:stats", f"DELIVERED {m['parcels_delivered']}/{m['parcels_total']}     "
+                                    f"DISTANCE {m['total_distance']}     CONFLICTS {m['conflicts']}     "
+                                    f"FLEET UTILIZATION {100 * self.tracker.fleet_utilization():.0f}%     "
+                                    f"COMPLETION {m['completion_pct']:.0f}%")
             return
         if not hud.visible:
             return
@@ -772,6 +1065,8 @@ class WarehouseApp3D:
         hud.set_selector("quality", self.quality)
         hud.set_button("paths", active=self.show_paths)
         hud.set_button("compare", active=self.show_compare)
+        hud.set_button("heatmap", active=self.show_heatmap)
+        hud.set_button("indicators", active=self.show_indicators)
         for mode in MODE_LABELS:
             hud.set_button(f"cam:{mode}", active=(mode == self.camera.mode and not self.camera.in_intro))
         hud.set_button("analytics", active=self.analytics.visible)
@@ -794,7 +1089,19 @@ class WarehouseApp3D:
         hud.set_text("m:pct", f"{m['completion_pct']:.0f}%", H.GOOD if m["completion_pct"] >= 100 else H.TEXT)
         hud.set_text("m:term", engine.termination_reason if engine.done else LAYOUT_LABELS.get(cfg.layout, ""))
         hud.set_progress(m["completion_pct"] / 100)
-        hud.set_text("banner", ctl.message)
+        msg = self._banner_msg if self.time - self._banner_time < BANNER_SECONDS else ""
+        hud.set_banner(msg)
+        legend = []
+        if self.show_compare:
+            legend.append("BFS explored = blue tint · A* explored = orange squares")
+        if self.show_heatmap:
+            hot = self.tracker.hotspot()
+            legend.append("Congestion heatmap: red = recent occupancy / waiting / conflicts"
+                          + (f" · hotspot {hot[0]}" if hot else ""))
+        hud.set_text("legend", "   |   ".join(legend))
+        if hud.right_tab == "fleet":
+            self._update_fleet_tab(engine)
+            return
         # robot inspector
         robot = engine.warehouse.robots[self.selected]
         wh = engine.warehouse
@@ -817,6 +1124,7 @@ class WarehouseApp3D:
         hud.set_text("r:dest", dest)
         hud.set_text("r:dist", f"{robot.distance_travelled} cells")
         hud.set_text("r:deliv", str(robot.deliveries_completed))
+        hud.set_text("r:util", f"{100 * self.tracker.utilization(robot.robot_id):.0f}%")
         hud.set_text("r:waits", f"{robot.waits} / {robot.conflicts}")
         rec = engine.last_decision.get(robot.robot_id)
         if rec is None:
@@ -825,7 +1133,7 @@ class WarehouseApp3D:
             hud.set_text("r:cands", "")
         else:
             hud.set_text("r:decision-head", f"Step {rec.step}  ·  {rec.chosen.label}  ->  {rec.outcome}")
-            reason = rec.reason if len(rec.reason) < 260 else rec.reason[:257] + "..."
+            reason = rec.reason if len(rec.reason) < 230 else rec.reason[:227] + "..."
             hud.set_text("r:decision", reason)
             lines = []
             for c in rec.candidates[:5]:
@@ -849,7 +1157,59 @@ class WarehouseApp3D:
             text = "Simple Reflex: no search\n(acts on adjacent cells only)\nPress C to see BFS vs A*"
         hud.set_text("r:search", text)
 
+    def _update_fleet_tab(self, engine) -> None:
+        hud = self.hud
+        tr = self.tracker
+        for act, n in tr.activity_counts().items():
+            hud.set_text(f"f:act:{act}", str(n), H.ACTIVITY_COLORS[act] if n else H.MUTED)
+        robots = engine.warehouse.robots
+        for i in range(3):
+            if i < len(robots):
+                u = tr.usage.get(i)
+                act = u.current if u else "idle"
+                hud.set_text(f"f:rname{i}", f"R{i}")
+                hud.set_text(f"f:rstate{i}", act, H.ACTIVITY_COLORS[act])
+                util = tr.utilization(i)
+                hud.set_text(f"f:rpct{i}", f"{100 * util:.0f}%")
+                hud.set_progress(util, key=f"util{i}", width=H.RIGHT_W - 32, height=6)
+            else:
+                for k in ("rname", "rstate", "rpct"):
+                    hud.set_text(f"f:{k}{i}", "")
+                hud.set_progress(0, key=f"util{i}", width=H.RIGHT_W - 32, height=6)
+        hud.set_text("f:fu", f"{100 * tr.fleet_utilization():.0f}%")
+        hud.set_text("f:tp", f"{tr.throughput():.1f}")
+        ct = tr.cycle_time(engine)
+        hud.set_text("f:ct", f"{ct:.1f} ticks" if ct is not None else "-")
+        hot = tr.hotspot()
+        hud.set_text("f:hot", f"{hot[0]}  heat {hot[1]:.1f}" if hot else "-")
+        hud.set_text("f:confl", str(len(tr.conflict_cells)))
+        prog = self._dock_progress
+        for i in range(4):
+            if i in prog:
+                done, total = prog[i]
+                hud.set_text(f"f:dock{i}", f"Dock D{i}")
+                hud.set_text(f"f:dockn{i}", f"{done} / {total}")
+                hud.set_progress(done / total if total else 0, key=f"dock{i}", width=H.RIGHT_W - 32, height=5)
+            else:
+                hud.set_text(f"f:dock{i}", "")
+                hud.set_text(f"f:dockn{i}", "")
+                hud.set_progress(0, key=f"dock{i}", width=H.RIGHT_W - 32, height=5)
+
     # ================================================================== public helpers
+    def visible_chunks(self) -> tuple[int, int]:
+        """(chunks intersecting the camera frustum, total chunks) - what frustum culling keeps."""
+        if self.vis is None:
+            return (0, 0)
+        frustum = self.base.camLens.makeBounds()
+        frustum.xform(self.base.cam.getMat(self.base.render))
+        visible = 0
+        for chunk in self.vis.chunks:
+            bounds = chunk.getBounds().makeCopy()
+            bounds.xform(chunk.getParent().getMat(self.base.render))
+            if frustum.contains(bounds):
+                visible += 1
+        return visible, len(self.vis.chunks)
+
     def frame(self, dt: float = 1 / 60) -> None:
         """Advance one frame deterministically (used by tests and screenshots)."""
         self._update(dt)
@@ -857,6 +1217,8 @@ class WarehouseApp3D:
 
     def screenshot(self, path: Path) -> Path:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self._shadow_force = True
+        self._schedule_shadows(self.sync.robot_poses(self.ctl.engine, self.ctl.animation_progress(), 0.0))
         self.base.graphicsEngine.renderFrame()
         self.base.graphicsEngine.renderFrame()
         self.base.win.saveScreenshot(Filename.fromOsSpecific(str(path)))

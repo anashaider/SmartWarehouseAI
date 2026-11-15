@@ -32,6 +32,13 @@ def shade(c: RGBA, f: float) -> RGBA:
     return (min(1.0, c[0] * f), min(1.0, c[1] * f), min(1.0, c[2] * f), c[3])
 
 
+def chamfered_rect(w: float, h: float, c: float, cx: float = 0.0, cy: float = 0.0) -> list[tuple[float, float]]:
+    """Octagon: a w x h rectangle with corners cut by ``c`` (counter-clockwise)."""
+    x0, x1, y0, y1 = cx - w / 2, cx + w / 2, cy - h / 2, cy + h / 2
+    return [(x0 + c, y0), (x1 - c, y0), (x1, y0 + c), (x1, y1 - c), (x1 - c, y1), (x0 + c, y1), (x0, y1 - c),
+            (x0, y0 + c)]
+
+
 class MeshBuilder:
     def __init__(self, name: str = "mesh") -> None:
         self.name = name
@@ -172,6 +179,30 @@ class MeshBuilder:
                 for i in range(segments)]
         for i in range(segments):
             self.tris.addVertices(center, ring[i], ring[(i + 1) % segments])
+
+    def prism(self, poly: Sequence[tuple[float, float]], z0: float, z1: float, c: RGBA,
+              top: RGBA | None = None, cap_bottom: bool = False) -> None:
+        """Vertical extrusion of a convex polygon (counter-clockwise, seen from above)."""
+        n = len(poly)
+        side = shade(c, 0.95)
+        for i in range(n):
+            ax, ay = poly[i]
+            bx, by = poly[(i + 1) % n]
+            ex, ey = bx - ax, by - ay
+            L = math.hypot(ex, ey) or 1.0
+            nrm = (ey / L, -ex / L, 0.0)
+            self.quad((ax, ay, z0), (bx, by, z0), (bx, by, z1), (ax, ay, z1), nrm, side,
+                      ((0, 0), (L, 0), (L, z1 - z0), (0, z1 - z0)))
+        t = top or c
+        center = self._vertex((sum(p[0] for p in poly) / n, sum(p[1] for p in poly) / n, z1), (0, 0, 1), t, (0.5, 0.5))
+        ring = [self._vertex((x, y, z1), (0, 0, 1), t, (x, y)) for x, y in poly]
+        for i in range(n):
+            self.tris.addVertices(center, ring[i], ring[(i + 1) % n])
+        if cap_bottom:
+            cb = self._vertex((sum(p[0] for p in poly) / n, sum(p[1] for p in poly) / n, z0), (0, 0, -1), shade(c, 0.6), (0.5, 0.5))
+            rb = [self._vertex((x, y, z0), (0, 0, -1), shade(c, 0.6), (x, y)) for x, y in poly]
+            for i in range(n):
+                self.tris.addVertices(cb, rb[(i + 1) % n], rb[i])
 
     def node(self) -> GeomNode:
         geom = Geom(self.vdata)

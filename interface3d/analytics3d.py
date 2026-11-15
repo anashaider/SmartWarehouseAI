@@ -32,6 +32,7 @@ CHARTS = [
     ("chart6_conflicts", "6  Robot conflicts"),
     ("chart7_scenario_success", "7  Scenario-wise success"),
     ("chart8_allocation", "8  Allocation baseline"),
+    ("chart9_utilization", "9  Robot utilization"),
 ]
 BUDGET_S = 0.025
 
@@ -65,6 +66,7 @@ class AnalyticsOverlay:
         hud.root = self.root        # reuse the HUD widget helpers on this layer
         top = H.TOP_H
         hud._frame(0, top, width, height - top, (0.03, 0.045, 0.08, 1.0))
+        hud.blocking_rects.append((0, top, width, height - top))
         side_w = 290
         x0 = 20
         y = top + 20
@@ -77,26 +79,37 @@ class AnalyticsOverlay:
         hud.button("an:folder", "OPEN FOLDER", x0 + half + 8, y, half, 30, self.open_folder)
         y += 40
         hud._frame(x0, y, side_w - 20, 6, H.CARD)
-        self.bar = hud._frame(x0, y, 1, 6, H.ACCENT)
+        self.bar = hud._frame(x0, y, 1, 6, H.ACCENT, dynamic=True)
         self.bar_w = side_w - 20
         hud.text("an:progress", "", x0, y + 12, 11, H.TEXT2, wrap=side_w - 20)
         y += 50
         for i, (_, label) in enumerate(CHARTS):
-            hud.button(f"an:chart{i}", label, x0, y, side_w - 20, 32, lambda i=i: self.select(i), size=12)
-            y += 37
+            hud.button(f"an:chart{i}", label, x0, y, side_w - 20, 30, lambda i=i: self.select(i), size=12)
+            y += 34
         y += 6
         hud.text("an:msg", "", x0, y, 11, H.TEXT2, wrap=side_w - 20)
         hud.text("an:meta", "", x0, y + 52, 11, H.TEXT2, mono=True)
         hud.button("an:close", "CLOSE  (Esc)", width - 150, top + 16, 130, 30, self.hide)
+        # KPI tiles (computed from the recorded results)
+        kx = x0 + side_w + 10
+        kw_total = width - kx - 170
+        kpis = 5
+        kw = (kw_total - (kpis - 1) * 10) / kpis
+        for i in range(kpis):
+            hud._frame(kx + i * (kw + 10), top + 14, kw, 64, H.PANEL)
+            hud._frame(kx + i * (kw + 10), top + 14, 3, 64, H.ACCENT)
+            hud.text(f"an:kpi{i}", "", kx + i * (kw + 10) + 14, top + 22, 20, H.TEXT, bold=True)
+            hud.text(f"an:kpil{i}", "", kx + i * (kw + 10) + 14, top + 52, 10, H.TEXT2, wrap=kw - 20)
         # chart area
-        self.chart_box = (x0 + side_w + 10, top + 58, width - (x0 + side_w + 10) - 20, height - top - 58 - 230)
-        hud.text("an:title", "", self.chart_box[0], top + 20, 16, H.TEXT, bold=True)
+        self.chart_box = (kx, top + 120, width - kx - 20, height - top - 120 - 230)
+        hud.text("an:title", "", self.chart_box[0], top + 92, 15, H.TEXT, bold=True)
         tx, ty = self.chart_box[0], height - 220
         hud._frame(tx, ty, self.chart_box[2], 200, H.PANEL)
         hud.text(None, "AGENT SUMMARY (mean per run)", tx + 14, ty + 10, 11, H.ACCENT_HOVER, bold=True)
         hud.text("an:agents", "", tx + 14, ty + 32, 12, H.TEXT, mono=True)
         hud.text("an:searchhead", "", tx + self.chart_box[2] * 0.56, ty + 10, 11, H.ACCENT_HOVER, bold=True)
         hud.text("an:search", "", tx + self.chart_box[2] * 0.56, ty + 32, 12, H.TEXT, mono=True)
+        hud.finalize(self.root)
         hud.root = saved_root
         self.image = None
         self._image_key = None
@@ -212,6 +225,7 @@ class AnalyticsOverlay:
             lines.append(f"{r.agent_label:<14}{r.avg_delivered:>7.2f}{r.avg_completion_pct:>8.1f}"
                          f"{r.avg_completion_steps:>8.0f}{r.avg_distance:>8.0f}{r.avg_conflicts:>7.1f}")
         hud.set_text("an:agents", "\n".join(lines))
+        self._set_kpis(a)
         s = search_summary(self.results.search)
         opt = path_optimality_check(self.results.search)
         hud.set_text("an:searchhead", f"SEARCH SUMMARY  ·  equal path length {opt['equal_length']}/{opt['queries_compared']}")
@@ -220,6 +234,31 @@ class AnalyticsOverlay:
             lines.append(f"{r.size_class:<8}{r.algorithm_label:<5}{r.avg_path_length:>7.2f}"
                          f"{r.avg_nodes_expanded:>8.1f}{r.avg_runtime_ms:>8.3f}")
         hud.set_text("an:search", "\n".join(lines))
+
+    def _set_kpis(self, agents) -> None:
+        """Headline numbers, all computed from the saved CSV results."""
+        hud = self.hud
+        runs, search = self.results.runs, self.results.search
+        found = search[search["found"].astype(bool)]
+        bfs_n = found[found["algorithm"] == "bfs"]["nodes_expanded"].mean()
+        ast_n = found[found["algorithm"] == "astar"]["nodes_expanded"].mean()
+        opt = path_optimality_check(search)
+        plan = runs[runs["agent"] != "simple_reflex"]
+        util = (runs["total_distance"] / (runs["robots"] * runs["steps"].clip(lower=1))).groupby(
+            runs["agent_label"]).mean()
+        tiles = [
+            (f"{bfs_n / ast_n:.1f}x" if ast_n else "-", "fewer nodes expanded by A* than BFS (same queries)"),
+            (f"{opt['equal_length']}/{opt['queries_compared']}", "queries where BFS and A* path lengths are equal"),
+            (f"{plan['completion_pct'].mean():.0f}%", "delivery completion, Goal-Based + Utility-Based agents"),
+            (f"{runs[runs['agent'] == 'simple_reflex']['completion_pct'].mean():.0f}%",
+             "delivery completion, Simple Reflex agent"),
+            (f"{100 * util.get('Goal-Based', 0):.0f}%",
+             f"of robot-ticks spent moving, Goal-Based (Reflex {100 * util.get('Simple Reflex', 0):.0f}%: "
+             "busy but mostly unproductive)"),
+        ]
+        for i, (value, label) in enumerate(tiles):
+            hud.set_text(f"an:kpi{i}", value)
+            hud.set_text(f"an:kpil{i}", label)
 
     def _show_chart(self, name: str) -> None:
         path = Path(CHARTS_DIR) / f"{name}.png"
@@ -241,3 +280,4 @@ class AnalyticsOverlay:
         self.image = OnscreenImage(image=tex, parent=self.root, scale=(w / 2, 1, h / 2),
                                    pos=(bx + bw / 2, 0, -(by + bh / 2)))
         self.image.setTransparency(TransparencyAttrib.MAlpha)
+        self.image.setBin("fixed", H.LAYER_BASE["analytics"] + 1)

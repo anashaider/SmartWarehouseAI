@@ -40,6 +40,7 @@ CHART_TITLES = {
     "chart6_conflicts": "Robot Conflict Comparison",
     "chart7_scenario_success": "Scenario-wise Delivery Success",
     "chart8_allocation": "Task Allocation Baseline Comparison",
+    "chart9_utilization": "Robot Movement Utilization",
 }
 
 
@@ -204,4 +205,14 @@ def generate_all_charts(results: ExperimentResults, out_dir: Path = CHARTS_DIR) 
     _legend(ax, "Allocation")
     paths.append(_save(fig, out_dir, "chart8_allocation",
                        "Fixed-order baseline vs nearest-parcel allocation, all scenarios and algorithms."))
+
+    # 9. Movement utilization (derived from recorded columns) -----------------
+    fig, ax = _figure()
+    runs = runs.assign(utilization=100.0 * runs["total_distance"] / (runs["robots"] * runs["steps"].clip(lower=1)))
+    _grouped_bars(ax, _by_size(runs, "agent_label", "utilization", AGENT_ORDER), groups, AGENT_ORDER, "{:.0f}")
+    _style(ax, CHART_TITLES["chart9_utilization"], "Robot-ticks spent moving (%)", "Warehouse size")
+    ax.set_ylim(0, 100)
+    _legend(ax, "Agent")
+    paths.append(_save(fig, out_dir, "chart9_utilization",
+                       "Utilization = total distance / (robots x simulated steps), from the recorded run metrics."))
     return paths

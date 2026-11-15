@@ -62,7 +62,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--no-intro", action="store_true", help="skip the 3D opening flythrough")
     p.add_argument("--present", action="store_true", help="start the 3D app in Presentation Mode")
     p.add_argument("--screenshot3d", type=Path, help="render the 3D digital twin offscreen and save a PNG")
-    p.add_argument("--camera", choices=["overview", "topdown", "follow", "free", "focus"], default="overview",
+    p.add_argument("--camera", choices=["overview", "topdown", "tracking", "follow", "free", "focus"], default="overview",
                    help="camera mode for --screenshot3d")
     p.add_argument("--size", default="1600x900", help="window size for --screenshot3d, e.g. 1920x1080")
     return p.parse_args(argv)
