@@ -47,6 +47,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--allocation", choices=ALLOCATION_POLICIES, default="nearest")
     p.add_argument("--robots", type=int, choices=range(MIN_ROBOTS, MAX_ROBOTS + 1), default=DEFAULT_ROBOTS)
     p.add_argument("--seed", type=int, default=DEFAULT_SEED, help="seed for the random layout / agents")
+    p.add_argument("--max-steps", type=int, default=None,
+                   help="hard tick limit for one run (default: derived from the layout size)")
+    p.add_argument("--stagnation-limit", type=int, default=None,
+                   help="ticks without task progress before a run is terminated as incomplete "
+                        "(default: derived from the layout size; 0 disables the watchdog)")
+    p.add_argument("--trace", action="store_true",
+                   help="with --headless: print a per-tick log of positions, actions, percepts and targets")
     p.add_argument("--experiments", action="store_true", help="run the experiment suite and exit")
     p.add_argument("--scenarios", type=int, default=EXPERIMENT_SCENARIOS)
     p.add_argument("--base-seed", type=int, default=EXPERIMENT_BASE_SEED)
@@ -129,7 +136,13 @@ def screenshot_3d(config: SimulationConfig, args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     config = SimulationConfig(layout=args.layout, agent_type=args.agent, algorithm=args.algorithm,
-                              allocation=args.allocation, num_robots=args.robots, seed=args.seed)
+                              allocation=args.allocation, num_robots=args.robots, seed=args.seed,
+                              max_steps=args.max_steps, stagnation_limit=args.stagnation_limit)
+    try:
+        config.validate()
+    except ValueError as exc:
+        print(f"Invalid configuration: {exc}")
+        return 2
 
     if args.experiments:
         from experiments.experiment_runner import run_and_export
@@ -138,9 +151,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.headless:
         from simulation.simulation_controller import SimulationController
+        from simulation.run_trace import format_tick
         ctl = SimulationController(config)
-        engine = ctl.engine.run()
+        engine = ctl.engine
         print(f"Scenario: {ctl.scenario.name}")
+        while not engine.done:
+            engine.step()
+            if args.trace:
+                print(format_tick(engine))
+        print(f"Outcome: {engine.outcome} ({engine.termination_reason})")
         print(json.dumps(engine.metrics(), indent=2))
         return 0
 

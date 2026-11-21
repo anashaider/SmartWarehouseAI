@@ -4,7 +4,7 @@
 
 ```bash
 pip install -r requirements.txt
-python -m pytest -q                 # expect: 181 passed
+python -m pytest -q                 # expect: 205 passed
 python main.py --experiments        # ~1 minute, regenerates data/results and charts
 python main.py                      # 3D digital twin (python main.py --2d for the 2D dashboard)
 ```
@@ -35,7 +35,7 @@ If the GPU struggles, press `Q` until Quality = Low, or run `python main.py --2d
 | 3 | **Step** a few times | "One click = one tick. The robot glides between the two cells it really occupied." |
 | 4 | Open **Search** tab, toggle **BFS vs A\* overlay** (C) | Same shortest length, but BFS (blue tint) explored far more cells than A* (orange squares). Read the table: nodes expanded, runtime. |
 | 5 | Switch agent to **Utility-Based**, open **Decisions** tab, Step | Show the five candidate actions with their U values, the chosen one in green, and the reason sentence. Explain the formula (§4 below). |
-| 6 | Switch to **Simple Reflex**, Large layout, speed 24 → Start | Robots oscillate behind shelf rows: no planning. Note "Pathfinding (unused by reflex)". |
+| 6 | Switch to **Simple Reflex**, Large layout, speed 24 → Start | Robots oscillate behind shelf rows: no planning. Note "Pathfinding (unused by reflex)". The completion card shows "stalled N/limit"; when the stagnation limit is hit the status turns **TERMINATED** with the reason and the undelivered parcel count. |
 | 7 | Small layout, Goal-Based, 3 robots, speed 4 | Watch amber pause badges (waiting) and cyan rings (yielding). Open **Events** tab: conflicts, yields, pickups, deliveries. |
 | 8 | Layout **Random**, change seed | Seeded generator: same seed, same warehouse. |
 | 9 | **Analytics** (A) | Charts 1-3 (required) plus extras; summary tables; "equal path length in 960/960 queries". Optionally click **Run Experiments** to show it runs live. |
@@ -44,9 +44,9 @@ If the GPU struggles, press `Q` until Quality = Low, or run `python main.py --2d
 
 - 24 seeded scenarios, 288 simulation runs, 960 BFS/A* query pairs.
 - BFS and A* have equal path lengths in 960/960 queries; A* expands ~6× fewer nodes (131.2 vs 22.0).
-- Goal-Based and Utility-Based: 100% delivery in all runs. Simple Reflex: 35.8% average, 6/96 complete.
+- Goal-Based and Utility-Based: 100% delivery in all runs. Simple Reflex: 36.2% average, 8/96 complete; the other 88 runs end TERMINATED by the stagnation watchdog.
 - Nearest allocation vs fixed order: Goal-Based distance 322 → 278 cells.
-- 181 automated tests (134 core + 47 for the 3D layer and launcher).
+- 205 automated tests (134 core + 47 for the 3D layer and launcher + 24 for the reflex-loop regression and watchdog).
 
 ## 4. Viva questions and answers
 
@@ -79,6 +79,9 @@ Robots act in a rotating turn order. A move is allowed only into a cell that is 
 
 **Q: How do you handle deadlocks?**
 If robots block each other for 3 ticks, the lower-priority robot (not carrying, then higher id) runs BFS to the nearest cell outside the other robot's route, retreats there, holds for 2 ticks and resumes. Before adding this, 14 runs livelocked in dead-end aisles; after it, none did.
+
+**Q: Why did the Simple Reflex simulation seem to run forever?**
+On the last parcel an idle robot stayed parked on the drop-off station. The reflex carrier never bumped into it: rule 5 side-steps to a random free cell. So no conflict was recorded, the "idle robot yields" rule never fired, and the carrier circled until the step limit. The engine now detects an idle robot on a working robot's route from the percept, so the idle robot yields. A watchdog detects oscillation and stagnation and ends stuck runs as TERMINATED. The reflex agent itself was not changed (no memory, no search), and delivery is never forced.
 
 **Q: Limitations of your coordination?**
 It is decentralised and greedy, not an optimal multi-agent planner (e.g. CBS). Robots may detour or retreat unnecessarily, and adversarial maps could still defeat the heuristic.

@@ -46,7 +46,9 @@ its logic (only to measure compute time).
 | `coordination/reservations.py` | Per-tick vertex and edge reservation table. |
 | `simulation/simulation_engine.py` | The tick algorithm, percept construction, action execution, conflict measurement, decision history, events, metrics. |
 | `simulation/simulation_controller.py` | Start / pause / resume / step / reset, configuration changes, fixed-timestep tick scheduling, animation progress. |
-| `simulation/state_manager.py` | READY / RUNNING / PAUSED / FINISHED status machine. |
+| `simulation/state_manager.py` | READY / RUNNING / PAUSED / FINISHED status machine. The UI shows a finished run as **COMPLETED** (every parcel delivered) or **TERMINATED** (stopped incomplete) via `SimulationController.display_status`. |
+| `simulation/progress_monitor.py` | Run watchdog (observes only, never steers an agent): per-robot oscillation, repeated world states and stagnation (no task progress for `stagnation_limit` ticks). |
+| `simulation/run_trace.py` | Per-tick text trace for `python main.py --headless --trace`. |
 | `experiments/` | Runner (generator-based), metric definitions and summaries, CSV/JSON export/import, Matplotlib charts. |
 | `interface/` | All Pygame drawing and input handling. |
 
@@ -63,11 +65,28 @@ its logic (only to measure compute time).
            percept  = build_percept(robot)                         (sensors)
            decision = agent.decide(percept)                         (agent program)
            _execute(robot, decision)                                (actuators, validated)
-           _measure_conflict(robot, ...)                            (metric only)
+           _measure_conflict(robot, ...)                            (metric + idle-blocker detection)
 6. Warehouse.check_invariants()       raises if two robots share a cell, a robot is on a shelf,
                                       or a parcel is held by two robots
-7. termination check                  all delivered | step limit | remaining parcels unreachable
+7. ProgressMonitor.observe()          oscillation / repeated-state / stagnation detection
+8. termination check                  COMPLETED: all delivered
+                                      TERMINATED: step limit | stagnation | remaining parcels unreachable
 ```
+
+**Idle-blocker detection.** `_measure_conflict` registers an *idle* robot that
+occupies a cell on a working robot's shortest route as that robot's blocker,
+even when the working robot side-stepped instead of bumping into it. Without
+this, the Simple Reflex agent (whose rule 5 side-steps rather than waits) never
+produced a rejected move or WAIT, the "idle robot yields at once" rule never
+fired, and the carrier looped around an idle robot parked on its drop-off
+station until the step limit.
+
+**Watchdog.** Task progress = a pickup, a delivery, or a robot reaching a new
+best true distance to its current target. A run with no progress for
+`stagnation_limit` ticks (default `max(60, 0.5 × free cells)`, configurable,
+`0` disables) is terminated as incomplete. `max_steps` (default
+`max(300, 2 × free cells)`) remains the hard limit. Both are fields of
+`SimulationConfig` and CLI flags (`--max-steps`, `--stagnation-limit`).
 
 Robots act **sequentially within a tick**. A robot may only enter a cell that is
 free at the moment it acts and is not reserved by a robot that already acted.

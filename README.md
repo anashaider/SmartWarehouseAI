@@ -64,10 +64,11 @@ Environment properties: fully observable map, deterministic, discrete, sequentia
 - **Explainability:** for every decision, the robot inspector shows the percepts, the available actions (with utility scores for the Utility-Based agent), the chosen action and a plain-language reason. The full decision history is browsable.
 - **BFS vs A\* overlay:** both searches are run from the selected robot to its target. The view draws both paths and the cells each one expanded, and the panel compares path length, nodes expanded/generated and runtime.
 - **Performance bar:** deliveries, pending parcels, distance, steps, invalid moves, robot conflicts, nodes expanded, completion %.
-- **Analytics screen:** runs the full experiment suite inside the app without freezing it, then shows the 8 charts and summary tables.
+- **Analytics screen:** runs the full experiment suite inside the app without freezing it, then shows the 9 charts and summary tables.
+- **Honest run outcomes:** every run ends as **COMPLETED** (all parcels delivered) or **TERMINATED** (incomplete) with the reason shown - step limit, stagnation, or unreachable parcels. A watchdog detects oscillating robots and repeated world states and stops runs that make no progress, so a stuck run never appears to go on forever.
 - **Experiment runner (CLI):** reproducible, seeded, exports CSV + JSON + PNG charts.
 - **Robust I/O:** missing or corrupted layout/result files are detected and handled with clear messages and fallbacks.
-- **181 automated tests**, including headless tests that click the real 2D dashboard buttons and offscreen tests of the 3D digital twin.
+- **205 automated tests**, including headless tests that click the real 2D dashboard buttons and offscreen tests of the 3D digital twin.
 
 ## 4. Technology Stack
 
@@ -92,7 +93,9 @@ python main.py --quality low --no-intro           # 3D for slow GPUs, skip the o
 python main.py --2d                               # classic 2D dashboard
 python main.py --layout large --agent utility_based --algorithm bfs --robots 2
 python main.py --layout random --seed 123         # seeded random warehouse
-python main.py --headless --layout medium         # one run without a window, prints metrics
+python main.py --headless --layout medium         # one run without a window, prints outcome + metrics
+python main.py --headless --agent simple_reflex --trace   # per-tick log: positions, actions, percepts, targets
+python main.py --max-steps 400 --stagnation-limit 80      # override the run limits (0 disables the watchdog)
 python main.py --experiments                      # full experiment suite (~1 min) -> data/results/
 python main.py --screenshot out.png --ticks 25    # render the 2D dashboard to a PNG (no window)
 python main.py --screenshot3d out.png --camera follow --quality high   # render the 3D twin offscreen
@@ -106,7 +109,7 @@ python main.py --screenshot3d out.png --camera follow --quality high   # render 
 ## 7. Tests
 
 ```bash
-python -m pytest            # 181 tests, ~45 s (3D tests render offscreen; skipped without OpenGL)
+python -m pytest            # 205 tests, ~2-3 min (3D tests render offscreen; skipped without OpenGL)
 ```
 
 | File | Covers |
@@ -121,6 +124,7 @@ python -m pytest            # 181 tests, ~45 s (3D tests render offscreen; skipp
 | `test_app3d.py` | offscreen 3D app: robot nodes vs simulation, pickup/delivery visuals, BFS/A* overlay, HUD pause/resume/step/reset, presentation, cameras and occlusion, picking, quality presets, analytics, intro |
 | `test_launcher.py` | 3D is the default; 2D fallback when Panda3D is unavailable |
 | `test_visual_v2.py` | motion profile, differential wheels, fleet tracker vs engine, heat decay, tick listeners, cinematic shot framing, camera transitions (no GPU needed) |
+| `test_reflex_stagnation.py` | regression for the Simple Reflex last-parcel loop, idle-blocker detection, oscillation / repeated-state / stagnation watchdog, configurable limits, COMPLETED vs TERMINATED status, reflex agent stays memoryless and search-free |
 
 ## 8. Experiments
 
@@ -138,17 +142,21 @@ summary CSVs, `experiment_results.json` (metadata, summaries, raw rows) and
 
 | Agent | Avg. completion | Runs fully completed | Avg. steps | Avg. distance | Avg. conflicts | Avg. nodes expanded |
 |---|---|---|---|---|---|---|
-| Simple Reflex | 35.8 % | 6 / 96 | 510.9 | 1413.5 | 14.9 | 0 |
+| Simple Reflex | 36.2 % | 8 / 96 | 199.2 | 555.2 | 4.5 | 0 |
 | Goal-Based | 100 % | 96 / 96 | 129.5 | 300.1 | 9.0 | 1,655 |
 | Utility-Based | 100 % | 96 / 96 | 129.6 | 294.9 | 8.1 | 30,676 |
 
 | Search (960 queries each) | Avg. path length | Avg. nodes expanded | Avg. runtime |
 |---|---|---|---|
-| BFS | 16.14 | 131.2 | 1.47 ms |
-| A* | 16.14 | 22.0 | 0.31 ms |
+| BFS | 16.14 | 131.2 | 0.79 ms |
+| A* | 16.14 | 22.0 | 0.16 ms |
 
 BFS and A* returned equal-length (optimal) paths in **960 / 960** queries, and A*
-expanded about **6×** fewer nodes.
+expanded about **6×** fewer nodes. The 88 incomplete Simple Reflex runs all ended
+TERMINATED by the stagnation watchdog (no progress, typically a robot oscillating
+behind a shelf row), so their step and distance counts stop there rather than at
+the hard step limit. Simple Reflex is a deliberately weak, memoryless baseline;
+its results are reported as measured.
 
 | | |
 |---|---|
@@ -165,7 +173,33 @@ expanded about **6×** fewer nodes.
 
 Details, formulas and weights: [docs/ALGORITHMS.md](docs/ALGORITHMS.md). System design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## 10. Screenshots
+### Architecture
+
+```
+            ┌──────────── interface3d/ (Panda3D)  or  interface/ (Pygame) ────────────┐
+            │      reads engine state only; tick listeners never modify the engine     │
+            └──────────────────────────────────┬───────────────────────────────────────┘
+                                 SimulationController (start/pause/step/reset, tick rate)
+                                               │
+ SimulationEngine.step():  TaskAllocator → ConflictManager (turn order, yields)
+                           → per robot: Percept → Agent.decide() → validated action
+                           → invariants → ProgressMonitor (watchdog) → termination
+                                               │
+        agents/ (Reflex · Goal · Utility) ── algorithms/ (BFS · A*) ── environment/ (grid, robots, parcels)
+```
+
+## 10. Multi-Robot Coordination
+
+Two or three robots share the floor. The coordination layer is the same for every agent:
+
+- **Turn order** rotates every tick (tick *t* starts with robot *t mod n*), so no robot is permanently favoured.
+- **Move validation** rejects moves into shelves/walls, into occupied or already-reserved cells (vertex conflict) and head-on swaps (edge conflict). A rejected move becomes a WAIT. Two robots never share a cell; the engine verifies this after every tick.
+- **Deadlock handling (priority retreat):** robots blocked for 3 ticks, or an idle robot parked on a working robot's route, trigger a *yield*. The robot with lower right of way follows a BFS path to the nearest refuge cell and holds there briefly.
+- **Watchdog:** detects oscillation (a robot bouncing between ≤ 3 cells without progress), repeated world states and stagnation (no pickup, delivery or new best distance for `max(60, 0.5 × free cells)` ticks). Stagnation ends the run as TERMINATED; it never steers an agent or forces a delivery.
+
+**Simple Reflex fix (final release).** A run could appear to loop forever on the last parcel. The cause was not the reflex rules: an idle robot stayed parked on the drop-off station, and the reflex carrier side-stepped around it instead of bumping into it. No conflict was recorded, so the "idle robot yields" rule never fired, and the carrier circled until the step limit. The engine now registers an idle robot on a working robot's route as a blocker. The watchdog ends genuinely stuck runs honestly as incomplete. The Simple Reflex agent itself is unchanged and still has no memory or search.
+
+## 11. Screenshots
 
 **3D digital twin**
 
@@ -186,8 +220,10 @@ Details, formulas and weights: [docs/ALGORITHMS.md](docs/ALGORITHMS.md). System 
 | Decision inspector + BFS/A* overlay | Analytics |
 |---|---|
 | ![](docs/screenshots/utility_decisions_compare.png) | ![](docs/screenshots/analytics.png) |
+| **Simple Reflex run ended honestly as TERMINATED** | **Live simulation** |
+| ![](docs/screenshots/simulation_terminated.png) | ![](docs/screenshots/simulation.png) |
 
-## 11. Project Structure
+## 12. Project Structure
 
 ```
 main.py                  entry point / CLI
@@ -196,7 +232,8 @@ environment/             grid, parcel, robot FSM, warehouse invariants, layouts 
 algorithms/              bfs.py, astar.py, pathfinder.py (from scratch)
 agents/                  simple_reflex.py, goal_based.py, utility_based.py
 coordination/            conflict_manager.py, reservations.py, task_allocator.py
-simulation/              simulation_engine.py, simulation_controller.py, state_manager.py
+simulation/              simulation_engine.py, simulation_controller.py, state_manager.py,
+                         progress_monitor.py (watchdog), run_trace.py (--trace)
 interface/               2D Pygame dashboard (fallback): warehouse view, panels, analytics, widgets
 interface3d/             3D digital twin (Panda3D): sync (GPU-free), scene, robots, effects, camera, HUD, app
 experiments/             experiment_runner.py, metrics.py, result_exporter.py, charts.py
@@ -205,21 +242,31 @@ data/results/            generated experiment output (git-ignored)
 tests/                   pytest suite
 docs/                    proposal, architecture, algorithms, experiments, demo & viva guide
 tools/build_layouts.py   regenerates the predefined layout JSON files
+tools/bench3d.py         3D rendering benchmark
 ```
 
-## 12. Limitations
+## 13. Limitations
 
 - Coordination is decentralised and greedy (turn order + local yielding). It is safe (no collisions) but not an optimal multi-agent path finder such as CBS. Rare deadlock patterns are resolved by retreating, not by global planning.
-- The Simple Reflex agent is intentionally memoryless and often fails on larger layouts; this is a property of the architecture, not a bug.
+- The Simple Reflex agent is intentionally memoryless and often fails on larger layouts (21% delivery on large maps); this is a property of the architecture, not a bug. Its stuck runs are ended by the stagnation watchdog and reported as TERMINATED - completion is never forced.
 - Search runtimes are wall-clock measurements and vary between machines. Node counts and path lengths are exactly reproducible.
 - No physical robots, real maps, learning methods or production WMS integration (outside the approved scope).
 
-## 13. Documentation
+## 14. Documentation
 
-- [docs/PROPOSAL.md](docs/PROPOSAL.md) - approved proposal (source of truth)
+- [docs/PROPOSAL.md](docs/PROPOSAL.md) / [docs/PROPOSAL.pdf](docs/PROPOSAL.pdf) - the original approved proposal (source of truth)
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - modules, data flow, tick algorithm, coordination
 - [docs/ALGORITHMS.md](docs/ALGORITHMS.md) - BFS, A*, agents, utility function
 - [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) - methodology, metrics, results, discussion
 - [docs/VISUALIZATION_3D.md](docs/VISUALIZATION_3D.md) - 3D digital twin design, cameras, presentation, intelligence, validation
 - [docs/OPTIMIZATION_V2.md](docs/OPTIMIZATION_V2.md) - V2 rendering audit and before/after measurements
 - [docs/DEMO_GUIDE.md](docs/DEMO_GUIDE.md) - live demo script and viva preparation
+
+## 15. Team
+
+| Member | Roll No. | Responsibilities (from the proposal) |
+|---|---|---|
+| **Anas Haider** (Group Leader) | 24K-2002 | Project coordination, warehouse environment, simulator integration, testing, final documentation |
+| **Shayan Hassan** | 24K-2050 | Search algorithm implementation, agent logic, performance measurements, charts, testing |
+
+AL-2002 Artificial Intelligence Lab · BSCY-5A · FAST-NUCES Karachi · Fall 2026.

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Optional
 
 # --------------------------------------------------------------------------- #
 # Paths
@@ -57,6 +58,22 @@ DEFAULT_SEED: int = 42
 #: ``max(MIN_STEP_LIMIT, STEP_LIMIT_PER_CELL * free_cells)``.
 MIN_STEP_LIMIT: int = 300
 STEP_LIMIT_PER_CELL: float = 2.0
+
+#: Stagnation watchdog: a run is terminated as INCOMPLETE when no task progress
+#: (pickup, delivery, or a robot getting closer to its target than ever before
+#: on its current task) happens for this many consecutive ticks. The effective
+#: limit is ``max(MIN_STAGNATION_LIMIT, STAGNATION_PER_CELL * free_cells)``.
+MIN_STAGNATION_LIMIT: int = 60
+STAGNATION_PER_CELL: float = 0.5
+
+#: Oscillation detector: a robot with a target is flagged as oscillating when,
+#: over the last OSCILLATION_WINDOW ticks, it visited at most
+#: OSCILLATION_MAX_CELLS distinct cells and made no progress to its target.
+OSCILLATION_WINDOW: int = 12
+OSCILLATION_MAX_CELLS: int = 3
+#: The global world state (robot cells + loads + delivered count) recurring this
+#: many times without task progress is reported as a repeated-state loop.
+REPEATED_STATE_THRESHOLD: int = 3
 
 #: Consecutive blocked ticks after which a robot is considered deadlocked and
 #: the coordination layer forces a "yield" (side step).
@@ -116,9 +133,18 @@ class SimulationConfig:
     num_robots: int = DEFAULT_ROBOTS
     seed: int = DEFAULT_SEED
     utility_weights: UtilityWeights = field(default_factory=UtilityWeights)
+    #: Hard tick limit; ``None`` -> derived from the layout size.
+    max_steps: Optional[int] = None
+    #: Ticks without task progress before the run is terminated as incomplete;
+    #: ``None`` -> derived from the layout size, ``0`` -> watchdog disabled.
+    stagnation_limit: Optional[int] = None
 
     def validate(self) -> None:
         """Raise ``ValueError`` for unsupported values."""
+        if self.max_steps is not None and self.max_steps < 1:
+            raise ValueError("max_steps must be a positive number of ticks")
+        if self.stagnation_limit is not None and self.stagnation_limit < 0:
+            raise ValueError("stagnation_limit must be >= 0 (0 disables the watchdog)")
         if self.agent_type not in AGENT_TYPES:
             raise ValueError(f"Unknown agent type: {self.agent_type!r}")
         if self.algorithm not in ALGORITHMS:

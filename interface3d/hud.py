@@ -43,7 +43,8 @@ GOOD = rgba("#22c55e")
 WARN = rgba("#f59e0b")
 BAD = rgba("#ef4444")
 INFO = rgba("#38bdf8")
-STATUS_COLORS = {"READY": INFO, "RUNNING": GOOD, "PAUSED": WARN, "FINISHED": rgba("#a78bfa")}
+STATUS_COLORS = {"READY": INFO, "RUNNING": GOOD, "PAUSED": WARN, "FINISHED": rgba("#a78bfa"),
+                 "COMPLETED": rgba("#a78bfa"), "TERMINATED": BAD}
 ACTIVITY_COLORS = {"moving": rgba("#3b82f6"), "handling": rgba("#22c55e"), "yielding": rgba("#22d3ee"),
                    "waiting": rgba("#f59e0b"), "idle": rgba("#64748b")}
 

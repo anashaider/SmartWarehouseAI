@@ -30,8 +30,10 @@ This isolates the algorithms from agent behaviour and robot interaction.
 Configurations: 3 agents × 2 algorithms × 2 allocation policies = 12, on all
 24 scenarios = **288 runs**. Every run builds a fresh `Warehouse` from the same
 `Scenario`, so robots, parcels and destinations start identically for every
-configuration. A run ends when every parcel is delivered, the step limit is
-reached, or no remaining parcel is reachable.
+configuration. A run ends when every parcel is delivered (COMPLETED), or is
+TERMINATED as incomplete when the step limit is reached, no task progress
+happens for the stagnation limit (see ARCHITECTURE.md §3), or no remaining
+parcel is reachable. The `outcome` and `termination_kind` columns record which.
 
 ## 4. Metrics
 
@@ -39,7 +41,7 @@ reached, or no remaining parcel is reachable.
 |---|---|
 | Parcels delivered | parcels that reached their destination station |
 | Total distance | sum of cells moved by all robots |
-| Completion steps | tick at which the last parcel was delivered; incomplete runs count the steps actually simulated (= the step limit) |
+| Completion steps | tick at which the last parcel was delivered; incomplete runs count the steps actually simulated (the step limit, or earlier if stopped by stagnation) |
 | Execution runtime | `compute_time_ms`: wall-clock time spent inside `SimulationEngine.step()`, with no rendering or animation; for searches, `runtime_ms` per query |
 | Nodes expanded | sum over every navigation search performed by the agents |
 | Invalid moves | attempted moves into shelves/walls and illegal pickup/deliver actions |
@@ -58,14 +60,14 @@ after every tick and it never occurred.
 
 | Size | Algorithm | Queries | Avg. path length | Avg. nodes expanded | Avg. runtime (ms) |
 |---|---|---|---|---|---|
-| small | BFS | 192 | 9.23 | 44.7 | 0.437 |
-| small | A* | 192 | 9.23 | 12.5 | 0.177 |
-| medium | BFS | 320 | 14.10 | 100.2 | 1.058 |
-| medium | A* | 320 | 14.10 | 17.7 | 0.249 |
-| large | BFS | 448 | 20.55 | 190.5 | 2.215 |
-| large | A* | 448 | 20.55 | 29.2 | 0.409 |
-| **all** | **BFS** | 960 | 16.14 | 131.2 | 1.474 |
-| **all** | **A\*** | 960 | 16.14 | 22.0 | 0.309 |
+| small | BFS | 192 | 9.23 | 44.7 | 0.258 |
+| small | A* | 192 | 9.23 | 12.5 | 0.089 |
+| medium | BFS | 320 | 14.10 | 100.2 | 0.584 |
+| medium | A* | 320 | 14.10 | 17.7 | 0.125 |
+| large | BFS | 448 | 20.55 | 190.5 | 1.173 |
+| large | A* | 448 | 20.55 | 29.2 | 0.206 |
+| **all** | **BFS** | 960 | 16.14 | 131.2 | 0.794 |
+| **all** | **A\*** | 960 | 16.14 | 22.0 | 0.156 |
 
 - **Path length:** identical in 960/960 queries, which confirms both implementations are optimal.
 - **Search effort:** A* expanded 5.96× fewer nodes overall, and the advantage grows with the map (3.6× small → 6.5× large).
@@ -77,15 +79,21 @@ Mean per run, averaged over both algorithms and both allocation policies (96 run
 
 | Agent | Parcels delivered | Completion % | Fully completed runs | Steps | Distance | Conflicts | Invalid moves | Nodes expanded | Engine time (ms) |
 |---|---|---|---|---|---|---|---|---|---|
-| Simple Reflex | 3.25 | 35.8 | 6 / 96 | 510.9 | 1413.5 | 14.9 | 0 | 0 | 70 |
-| Goal-Based | 10.00 | 100.0 | 96 / 96 | 129.5 | 300.1 | 9.0 | 0 | 1,655 | 64 |
-| Utility-Based | 10.00 | 100.0 | 96 / 96 | 129.6 | 294.9 | 8.1 | 0 | 30,676 | 296 |
+| Simple Reflex | 3.27 | 36.2 | 8 / 96 | 199.2 | 555.2 | 4.5 | 0 | 0 | 44 |
+| Goal-Based | 10.00 | 100.0 | 96 / 96 | 129.5 | 300.1 | 9.0 | 0 | 1,655 | 61 |
+| Utility-Based | 10.00 | 100.0 | 96 / 96 | 129.6 | 294.9 | 8.1 | 0 | 30,676 | 326 |
+
+Run outcomes: Goal-Based and Utility-Based were COMPLETED in 96/96 runs. Simple
+Reflex was COMPLETED in 8/96 and TERMINATED by the stagnation watchdog in 88/96
+(on average 3.9 oscillation detections per run). No run reached the hard step
+limit. With the watchdog disabled, every run delivers exactly the same number of
+parcels, so the early stop changes only how long a stuck run is simulated.
 
 By warehouse size:
 
 | Agent | Completion % (S / M / L) | Steps (S / M / L) | Distance (S / M / L) | Conflicts (S / M / L) |
 |---|---|---|---|---|
-| Simple Reflex | 45.8 / 40.6 / 21.0 | 254.7 / 458.8 / 819.2 | 471 / 1320 / 2450 | 26.6 / 15.9 / 2.2 |
+| Simple Reflex | 46.9 / 40.6 / 21.0 | 82.4 / 206.0 / 309.2 | 152 / 594 / 920 | 5.3 / 6.0 / 2.2 |
 | Goal-Based | 100 / 100 / 100 | 67.8 / 117.7 / 202.8 | 108 / 279 / 513 | 3.5 / 11.2 / 12.4 |
 | Utility-Based | 100 / 100 / 100 | 68.4 / 117.6 / 202.7 | 107 / 272 / 506 | 4.2 / 9.7 / 10.3 |
 
@@ -93,14 +101,14 @@ Per configuration (search cost depends on the algorithm; behaviour almost does n
 
 | Agent | Algorithm | Allocation | Steps | Distance | Nodes expanded | Engine ms |
 |---|---|---|---|---|---|---|
-| Goal-Based | BFS | Nearest | 123.9 | 277.7 | 2,622 | 67.7 |
-| Goal-Based | A* | Nearest | 123.6 | 278.0 | 405 | 52.9 |
-| Goal-Based | BFS | Fixed | 135.1 | 322.5 | 3,120 | 82.2 |
-| Goal-Based | A* | Fixed | 135.2 | 322.3 | 472 | 54.5 |
-| Utility-Based | BFS | Nearest | 123.1 | 272.0 | 46,757 | 428.7 |
-| Utility-Based | A* | Nearest | 123.1 | 272.0 | 6,465 | 117.5 |
-| Utility-Based | BFS | Fixed | 136.0 | 317.8 | 60,961 | 514.3 |
-| Utility-Based | A* | Fixed | 136.0 | 317.8 | 8,521 | 125.0 |
+| Goal-Based | BFS | Nearest | 123.9 | 277.7 | 2,622 | 69.7 |
+| Goal-Based | A* | Nearest | 123.6 | 278.0 | 405 | 51.5 |
+| Goal-Based | BFS | Fixed | 135.1 | 322.5 | 3,120 | 72.4 |
+| Goal-Based | A* | Fixed | 135.2 | 322.3 | 472 | 51.1 |
+| Utility-Based | BFS | Nearest | 123.1 | 272.0 | 46,757 | 446.1 |
+| Utility-Based | A* | Nearest | 123.1 | 272.0 | 6,465 | 133.5 |
+| Utility-Based | BFS | Fixed | 136.0 | 317.8 | 60,961 | 563.1 |
+| Utility-Based | A* | Fixed | 136.0 | 317.8 | 8,521 | 161.7 |
 
 ### 5.3 Charts
 
@@ -116,6 +124,7 @@ Generated in `data/results/charts/` (copies in `docs/images/`):
 | 6 | Robot conflicts per agent | `chart6_conflicts.png` |
 | 7 | Scenario-wise completion % heatmap (24 scenarios × 3 agents) | `chart7_scenario_success.png` |
 | 8 | Fixed-order vs nearest allocation (distance) | `chart8_allocation.png` |
+| 9 | Robot movement utilization (% of robot-ticks spent moving) | `chart9_utilization.png` |
 
 ![](images/chart1_path_length.png)
 ![](images/chart2_nodes_expanded.png)
@@ -125,13 +134,14 @@ Generated in `data/results/charts/` (copies in `docs/images/`):
 
 ## 6. Discussion (claims limited to what the data shows)
 
-1. **BFS vs A\*.** Both are optimal; A* reached the same path lengths with ~6× fewer expansions and less time. For the Utility-Based agent, which performs many searches, the choice of algorithm changed engine time from 429-514 ms to 118-125 ms per run with *identical* behaviour.
-2. **Planning matters.** Both search-based agents delivered every parcel in every run. The Simple Reflex agent delivered 35.8% on average and finished only 6/96 runs, because greedy local rules fail behind shelf rows. Its share drops from 45.8% (small) to 21.0% (large). It also travelled about 4.7× more cells.
+1. **BFS vs A\*.** Both are optimal; A* reached the same path lengths with ~6× fewer expansions and less time. For the Utility-Based agent, which performs many searches, the choice of algorithm changed engine time from 446-563 ms to 134-162 ms per run with *identical* behaviour.
+2. **Planning matters.** Both search-based agents delivered every parcel in every run. The Simple Reflex agent delivered 36.2% on average and finished only 8/96 runs, because greedy local rules fail behind shelf rows (the robot steps toward the target, meets a shelf, side-steps and steps back: an oscillation the watchdog detects). Its share drops from 46.9% (small) to 21.0% (large). Even though its stuck runs are now stopped early, it still travelled about 1.9× more cells than the planning agents.
 3. **Goal-Based vs Utility-Based.** Their completion and steps are practically equal (129.5 vs 129.6). Utility-Based travelled slightly less (294.9 vs 300.1 cells) and recorded fewer conflicts (8.1 vs 9.0), consistent with its congestion and conflict penalties. It used about 18× more node expansions (with caching). The data does **not** show one dominating the other on task completion.
 4. **Allocation baseline.** Nearest-parcel allocation beat the fixed-order baseline for the planning agents (e.g. Goal-Based distance 322.4 → 277.8 cells, steps 135.1 → 123.8).
 5. **Conflicts for the reflex agent** are lower on large maps (2.2) only because its robots rarely meet there; it spends most of its time stuck behind shelves.
 6. **Invalid moves were 0** for every agent. All three agents perceive the four neighbouring cells and only choose legal moves. The counter and its rejection path are exercised by unit tests (`test_rejected_move_is_counted_and_robot_waits`, `test_full_pickup_and_delivery_cycle`).
-7. **Deadlocks.** Before the priority-retreat mechanism was added, 14 of the 192 planning-agent runs livelocked in dead-end aisles. After it, all completed. On average there were 0.92 (Goal-Based) and 1.52 (Utility-Based) yields per run.
+7. **Deadlocks.** Before the priority-retreat mechanism was added, 14 of the 192 planning-agent runs livelocked in dead-end aisles. After it, all completed. On average there were 0.93 (Goal-Based) and 1.52 (Utility-Based) yields per run.
+8. **Simple Reflex last-parcel loop (fixed in the final release).** In the earlier recorded run, small and medium Simple Reflex runs often delivered every parcel but one and then circled until the step limit. Tracing showed an idle robot parked on the drop-off station: the reflex carrier side-stepped around it rather than bumping into it, so the coordination layer never registered the obstruction and never made the idle robot yield. The engine now registers idle robots on a working robot's route as blockers (Goal-Based results changed in 1 of 96 runs by one cell; Utility-Based unchanged). Completed Simple Reflex runs rose from 6 to 8. Previous figures for comparison: 35.8% completion, 510.9 steps, 1413.5 cells, because stuck runs ran to the step limit.
 
 ## 7. Threats to validity
 

@@ -297,7 +297,8 @@ class RobotPanel:
         visible = area.height // row_h
         self.events_scroll.offset = min(self.events_scroll.offset, max(0, len(events) - visible))
         colors = {"pickup": T.WARN, "deliver": T.GOOD, "conflict": T.BAD, "invalid": T.BAD,
-                  "yield": T.INFO, "assign": T.ACCENT_HOVER, "wait": T.TEXT_MUTED}
+                  "yield": T.INFO, "assign": T.ACCENT_HOVER, "wait": T.TEXT_MUTED,
+                  "oscillation": T.WARN, "repeated_state": T.WARN}
         y = area.y
         for ev in events[self.events_scroll.offset:self.events_scroll.offset + visible]:
             T.draw_text(surface, f"t{ev.step:>4}", (b.x, y + 1), 11, T.TEXT_MUTED, fnt=T.mono(11))

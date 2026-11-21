@@ -37,6 +37,7 @@ from environment.grid import MOVE_ACTIONS, Action, Position, action_between, app
 from environment.robot import Robot
 from environment.scenario_generator import Scenario
 from environment.warehouse import Warehouse
+from simulation.progress_monitor import ProgressMonitor, default_stagnation_limit
 
 
 @dataclass
@@ -45,6 +46,7 @@ class TickEvent:
 
     step: int
     kind: str          # assign | pickup | deliver | conflict | invalid | yield | wait
+                       # | oscillation | repeated_state (watchdog detections)
     robot_id: int
     position: Position
     message: str
@@ -79,7 +81,9 @@ class SimulationEngine:
         config.validate()
         self.scenario = scenario
         self.config = config
-        self.max_steps = max_steps or default_step_limit(scenario)
+        self.max_steps = max_steps or config.max_steps or default_step_limit(scenario)
+        self.stagnation_limit = (config.stagnation_limit if config.stagnation_limit is not None
+                                 else default_stagnation_limit(scenario))
         self.record_history = record_history
         self.reset()
 
@@ -100,6 +104,9 @@ class SimulationEngine:
         self.completion_step: Optional[int] = None
         self.done = False
         self.termination_reason = ""
+        #: "" while running, else completed | step_limit | stagnation | unreachable
+        self.termination_kind = ""
+        self.monitor = ProgressMonitor(self.stagnation_limit)
         self.compute_time_ms = 0.0
         self.deadlocks_resolved = 0
         self.events: list[TickEvent] = []          # events of the last tick
@@ -195,6 +202,8 @@ class SimulationEngine:
             self._measure_conflict(robot, percept, decision, events)
 
         wh.check_invariants()
+        for w in self.monitor.observe(step, wh, self._true_distance):
+            events.append(TickEvent(step, w.kind, w.robot_id, w.position, w.message))
         self.compute_time_ms += (time.perf_counter() - t0) * 1000
         self.events = events
         self.event_log.extend(events)
@@ -377,6 +386,9 @@ class SimulationEngine:
             self._dist_fields[target] = field_
         return field_
 
+    def _true_distance(self, cell: Position, target: Position) -> Optional[int]:
+        return self.distance_field(target).get(cell)
+
     def _measure_conflict(self, robot: Robot, percept: Percept, decision: Decision,
                           events: list[TickEvent]) -> None:
         """Count a robot conflict: the robot had a navigation target, did not get
@@ -390,10 +402,20 @@ class SimulationEngine:
         if d_before is None or d_after is None or d_after < d_before:
             return
         rejected = decision.action.is_move and robot.position == percept.position             and percept.neighbors.get(decision.action) == ROBOT
-        on_route = any(
-            dist.get(apply_move(percept.position, a)) == d_before - 1
-            for a in percept.neighbor_robot
-        )
+        on_route_blockers = [
+            rid for a, rid in sorted(percept.neighbor_robot.items())
+            if dist.get(apply_move(percept.position, a)) == d_before - 1
+        ]
+        on_route = bool(on_route_blockers)
+        # Idle robots parked on a working robot's route must yield (documented
+        # coordination rule). A robot that side-steps instead of bumping into
+        # the idle robot (e.g. Simple Reflex rule 5) never produced a rejected
+        # move or a WAIT, so the obstruction is registered here from the percept.
+        if robot.robot_id not in self._blocked_on:
+            for rid in on_route_blockers:
+                if not self.warehouse.robots[rid].has_task:
+                    self._blocked_on[robot.robot_id] = rid
+                    break
         if rejected or on_route:
             robot.conflicts += 1
             if not rejected:
@@ -427,17 +449,30 @@ class SimulationEngine:
     def _check_termination(self) -> None:
         wh = self.warehouse
         if wh.all_delivered():
-            self.done = True
+            self._finish("completed", "all parcels delivered")
             self.completion_step = self.step_count
-            self.termination_reason = "all parcels delivered"
         elif self.step_count >= self.max_steps:
-            self.done = True
-            self.termination_reason = f"step limit ({self.max_steps}) reached"
+            self._finish("step_limit", f"incomplete: step limit ({self.max_steps}) reached")
+        elif self.monitor.stagnated:
+            self._finish("stagnation",
+                         f"incomplete: no task progress for {self.monitor.ticks_without_progress} "
+                         f"ticks (stagnation limit {self.stagnation_limit})")
         elif not any(r.has_task for r in wh.robots):
             # Nothing in progress and nothing assignable -> remaining parcels unreachable.
             if all(self.allocator.choose(r, wh.waiting_parcels()) is None for r in wh.robots):
-                self.done = True
-                self.termination_reason = "remaining parcels unreachable"
+                self._finish("unreachable", "incomplete: remaining parcels unreachable")
+
+    def _finish(self, kind: str, reason: str) -> None:
+        self.done = True
+        self.termination_kind = kind
+        self.termination_reason = reason
+
+    @property
+    def outcome(self) -> str:
+        """RUNNING, COMPLETED (every parcel delivered) or TERMINATED (incomplete)."""
+        if not self.done:
+            return "RUNNING"
+        return "COMPLETED" if self.completion_step is not None else "TERMINATED"
 
     # ------------------------------------------------------------------ #
     def run(self) -> "SimulationEngine":
@@ -478,4 +513,9 @@ class SimulationEngine:
             "search_time_ms": round(search_ms, 4),
             "compute_time_ms": round(self.compute_time_ms, 4),
             "termination": self.termination_reason,
+            "outcome": self.outcome,
+            "termination_kind": self.termination_kind,
+            "oscillation_events": self.monitor.oscillation_events,
+            "repeated_state_events": self.monitor.repeated_state_events,
+            "stagnation_limit": self.stagnation_limit,
         }

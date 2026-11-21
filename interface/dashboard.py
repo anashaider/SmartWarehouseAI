@@ -252,7 +252,7 @@ class Dashboard:
             nx += 128
         # status cluster
         cfg = self.ctl.config
-        st = self.ctl.status.value
+        st = self.ctl.display_status
         items = [
             ("STATUS", st, T.STATUS_COLORS[st]),
             ("LAYOUT", LAYOUT_LABELS.get(cfg.layout, cfg.layout), T.TEXT),
@@ -312,8 +312,11 @@ class Dashboard:
         T.rounded_rect(s, T.CARD, bar, 4)
         T.rounded_rect(s, T.GOOD, pygame.Rect(bar.x, bar.y, int(bar.width * pct / 100), bar.height), 4)
         if engine.done:
-            T.draw_text(s, engine.termination_reason, (r.right - 14, r.y + 16), 10, T.TEXT_SECONDARY,
-                        anchor="topright", max_width=r.width - 100)
+            T.draw_text(s, engine.outcome, (r.right - 14, r.y + 42), 10, T.STATUS_COLORS[engine.outcome],
+                        bold=True, anchor="topright", max_width=r.width - 90)
+        elif engine.monitor.oscillating:
+            T.draw_text(s, f"stalled {engine.monitor.ticks_without_progress}/{engine.stagnation_limit}",
+                        (r.right - 14, r.y + 42), 10, T.WARN, anchor="topright", max_width=r.width - 90)
 
     def _draw_banner(self, s: pygame.Surface) -> None:
         msg = self.ctl.message
@@ -328,17 +331,25 @@ class Dashboard:
         if self.ctl.status != SimStatus.FINISHED:
             return
         m = engine.metrics()
-        r = pygame.Rect(0, 0, 420, 118)
+        done = m["completed"]
+        r = pygame.Rect(0, 0, 460, 118 if done else 136)
         r.midtop = (self.view.rect.centerx, self.view.rect.y + 36)
         T.alpha_rect(s, T.PANEL, r, 235, 12)
-        pygame.draw.rect(s, T.GOOD if m["completed"] else T.WARN, r, 1, border_radius=12)
-        title = "All parcels delivered" if m["completed"] else "Simulation stopped"
-        T.draw_text(s, title, (r.centerx, r.y + 14), 18, T.TEXT, bold=True, anchor="midtop")
+        pygame.draw.rect(s, T.GOOD if done else T.BAD, r, 1, border_radius=12)
+        title = ("COMPLETED · all parcels delivered" if done
+                 else f"TERMINATED · {m['parcels_pending']} parcel(s) undelivered")
+        T.draw_text(s, title, (r.centerx, r.y + 14), 18, T.TEXT if done else T.BAD, bold=True,
+                    anchor="midtop", max_width=r.width - 24)
         T.draw_text(s, f"{m['parcels_delivered']}/{m['parcels_total']} parcels · {m['completion_steps']} steps · "
                     f"{m['total_distance']} cells travelled", (r.centerx, r.y + 46), 13, T.TEXT_SECONDARY, anchor="midtop")
         T.draw_text(s, f"{m['conflicts']} conflicts · {m['deadlocks_resolved']} deadlocks resolved · "
                     f"engine time {m['compute_time_ms']:.1f} ms", (r.centerx, r.y + 68), 12, T.TEXT_MUTED, anchor="midtop")
-        T.draw_text(s, "Press R to reset or change a setting", (r.centerx, r.y + 92), 11, T.TEXT_MUTED, anchor="midtop")
+        y = r.y + 92
+        if not done:
+            T.draw_text(s, engine.termination_reason, (r.centerx, y), 11, T.WARN, anchor="midtop",
+                        max_width=r.width - 24)
+            y += 18
+        T.draw_text(s, "Press R to reset or change a setting", (r.centerx, y), 11, T.TEXT_MUTED, anchor="midtop")
 
     def _draw_help(self, s: pygame.Surface) -> None:
         T.alpha_rect(s, (0, 0, 0), s.get_rect(), 150)

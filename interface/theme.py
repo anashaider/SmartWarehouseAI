@@ -63,6 +63,8 @@ STATUS_COLORS = {
     "RUNNING": GOOD,
     "PAUSED": WARN,
     "FINISHED": hex_color("#a78bfa"),
+    "COMPLETED": hex_color("#a78bfa"),   # every parcel delivered
+    "TERMINATED": BAD,                   # stopped incomplete (limit / stagnation)
 }
 
 STATE_COLORS = {

@@ -57,6 +57,16 @@ class SimulationController:
         return self.state.status
 
     @property
+    def display_status(self) -> str:
+        """Status shown to the user: READY, RUNNING, PAUSED, or - once the run
+        has ended - COMPLETED (every parcel delivered) or TERMINATED (stopped
+        incomplete by the step limit, the stagnation watchdog or unreachable
+        parcels)."""
+        if self.status == SimStatus.FINISHED:
+            return self.engine.outcome
+        return self.status.value
+
+    @property
     def ticks_per_second(self) -> float:
         return SPEED_STEPS[self.speed_index]
 

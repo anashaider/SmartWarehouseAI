@@ -141,6 +141,7 @@ class WarehouseApp3D:
         self._banner_msg = ""
         self._banner_time = -1e9
         self._last_ctl_message = ""
+        self._outcome_announced = False
         self._shadow_sig = None
         self._shadow_force = True
         self._shadow_last_frame = -999
@@ -1012,11 +1013,15 @@ class WarehouseApp3D:
         hud = self.hud
         ctl = self.ctl
         cfg = ctl.config
-        st = ctl.status.value
+        st = ctl.display_status
         m = self._metrics
         if ctl.message and ctl.message != self._last_ctl_message:
             self.notify(ctl.message)
         self._last_ctl_message = ctl.message
+        if engine.done and not self._outcome_announced:
+            self.notify(f"{engine.outcome}: {engine.termination_reason} · "
+                        f"{m['parcels_delivered']}/{m['parcels_total']} parcels delivered")
+        self._outcome_announced = engine.done
         if self.camera.in_intro:
             sc = self.ctl.scenario
             hud.set_text("p:title", "Smart Warehouse AI")
@@ -1087,7 +1092,13 @@ class WarehouseApp3D:
         hud.set_text("m:steps", str(m["steps"]))
         hud.set_text("m:conf", str(m["conflicts"]), H.WARN if m["conflicts"] else H.TEXT)
         hud.set_text("m:pct", f"{m['completion_pct']:.0f}%", H.GOOD if m["completion_pct"] >= 100 else H.TEXT)
-        hud.set_text("m:term", engine.termination_reason if engine.done else LAYOUT_LABELS.get(cfg.layout, ""))
+        if engine.done:
+            hud.set_text("m:term", engine.outcome, H.STATUS_COLORS[engine.outcome])
+        elif engine.monitor.oscillating:
+            hud.set_text("m:term", f"stalled {engine.monitor.ticks_without_progress}/"
+                                   f"{engine.stagnation_limit}", H.WARN)
+        else:
+            hud.set_text("m:term", LAYOUT_LABELS.get(cfg.layout, ""), H.TEXT2)
         hud.set_progress(m["completion_pct"] / 100)
         msg = self._banner_msg if self.time - self._banner_time < BANNER_SECONDS else ""
         hud.set_banner(msg)

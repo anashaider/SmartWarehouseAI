@@ -5,6 +5,9 @@ Simulation-run metrics (one row per scenario x agent x algorithm x allocation)
 parcels_delivered   parcels that reached their destination station
 total_distance      sum of cells moved by all robots
 completion_steps    tick at which the last parcel was delivered (= steps run if incomplete)
+outcome             COMPLETED or TERMINATED; termination_kind = completed | step_limit |
+                    stagnation | unreachable
+oscillation_events  watchdog detections of a robot bouncing between <= 3 cells without progress
 compute_time_ms     wall-clock time of the engine's step() calls (no rendering)
 nodes_expanded      nodes expanded by every navigation search of every agent
 invalid_moves       attempted moves into shelves/walls + illegal pickup/deliver actions
